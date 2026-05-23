@@ -133,6 +133,7 @@ body {
 body.is-scrolling .glass-panel {
   backdrop-filter: none !important;
   -webkit-backdrop-filter: none !important;
+  transition: none !important;
 }
 
 /* Header */
@@ -722,9 +723,14 @@ body.is-resizing {
   border-color: rgba(255, 255, 255, 0.2);
 }
 
-/* Performance: Disable pointer events while scrolling to prevent hover calcs */
+/* Performance: Disable pointer events and transitions while scrolling to prevent hover/style recalcs */
 body.is-scrolling .gallery-item {
   pointer-events: none;
+  transition: none !important;
+}
+
+body.is-scrolling .manhwa-item img {
+  transition: none !important;
 }
 
 .gallery-item img,

@@ -98,33 +98,49 @@ let currentRAF = null; // Track current RAF to cancel on reset
 
 // Unload Observer for Virtual Scrolling / DOM Cleanup
 let unloadObserver = null;
+let unloadDebounceTimer = null;
 function initUnloadObserver() {
   if (unloadObserver) {
     unloadObserver.disconnect();
   }
+  // Pending unloads: debounce to avoid unloading items the user might scroll back to
+  const pendingUnloads = new Map();
+  const UNLOAD_DELAY = 8000; // 8s delay before actually unloading
+
   unloadObserver = new IntersectionObserver((entries) => {
     entries.forEach(entry => {
       const wrapper = entry.target;
       if (!entry.isIntersecting) {
-        // Scroll out of view: Unload
+        // Schedule deferred unload — don't unload immediately
         if (!wrapper.classList.contains('is-unloaded') && wrapper._file) {
-          const rect = wrapper.getBoundingClientRect();
-          if (rect.width > 0 && rect.height > 0) {
-            // Cache dimensions on wrapper to prevent layout collapse
-            wrapper.style.width = `${rect.width}px`;
-            wrapper.style.height = `${rect.height}px`;
+          if (!pendingUnloads.has(wrapper)) {
+            const timerId = setTimeout(() => {
+              pendingUnloads.delete(wrapper);
+              // Double-check it's still offscreen before unloading
+              if (wrapper.classList.contains('is-unloaded') || !wrapper._file) return;
+              const rect = wrapper.getBoundingClientRect();
+              if (rect.width > 0 && rect.height > 0) {
+                wrapper.style.width = `${rect.width}px`;
+                wrapper.style.height = `${rect.height}px`;
+              }
+              const img = wrapper.querySelector('img');
+              if (img && img.src && img.src.startsWith('blob:')) {
+                URL.revokeObjectURL(img.src);
+                objectURLs.delete(img.src);
+              }
+              wrapper.innerHTML = '';
+              wrapper.classList.add('is-unloaded');
+            }, UNLOAD_DELAY);
+            pendingUnloads.set(wrapper, timerId);
           }
-          const img = wrapper.querySelector('img');
-          // Revoke memory instantly
-          if (img && img.src && img.src.startsWith('blob:')) {
-            URL.revokeObjectURL(img.src);
-            objectURLs.delete(img.src);
-          }
-          wrapper.innerHTML = ''; // Clear DOM nodes
-          wrapper.classList.add('is-unloaded');
         }
       } else {
-        // Scrolled back into view: Reload
+        // Cancel any pending unload if scrolled back into view
+        if (pendingUnloads.has(wrapper)) {
+          clearTimeout(pendingUnloads.get(wrapper));
+          pendingUnloads.delete(wrapper);
+        }
+        // Scrolled back into view: Reload if was unloaded
         if (wrapper.classList.contains('is-unloaded') && wrapper._file) {
           wrapper.classList.remove('is-unloaded');
           const inner = createInnerElement(wrapper._file);
@@ -134,7 +150,7 @@ function initUnloadObserver() {
     });
   }, {
     root: mainBody,
-    rootMargin: "3000px" // Only unload items further than 3000px offscreen
+    rootMargin: "5000px" // Larger buffer: only unload items very far offscreen
   });
 }
 
@@ -1537,6 +1553,21 @@ function requestScrollTick(e) {
 }
 
 mainBody.addEventListener("scroll", requestScrollTick, { passive: true });
+
+// Pre-activate scroll optimizations on wheel event BEFORE the scroll actually fires.
+// This prevents the first-frame stutter after idle because:
+// 1. backdrop-filter is disabled before the scroll layout/paint
+// 2. pointer-events are disabled before hover recalc
+// The wheel event fires before the scroll event, giving us a head start.
+mainBody.addEventListener("wheel", () => {
+  if (!document.body.classList.contains("is-scrolling")) {
+    document.body.classList.add("is-scrolling");
+  }
+  clearTimeout(scrollTimeout);
+  scrollTimeout = setTimeout(() => {
+    document.body.classList.remove("is-scrolling");
+  }, 150);
+}, { passive: true });
 
 // Scroll buttons
 const scrollTopBtn = document.getElementById("scrollTopBtn");
