@@ -4,9 +4,10 @@
 - Non-recursive: only root folder images
 - Two tabs: Manga (grid + modal) and Manhwa (vertical, 70vw, no modal)
 - Gallery thumbnails uniform size via .gallery-item & object-fit: cover
-- Infinite scroll with IntersectionObserver + requestAnimationFrame
+- Infinite scroll with IntersectionObserver on #sentinel + requestAnimationFrame
 - Batch size fixed = 20
 - Performance Optimization: Uses createImageBitmap for thumbnails, Canvas for rendering
+- Deferred Object URL creation: URLs created at unveil time, not at DOM insertion
 */
 
 // Configure lazysizes for fast scrolling (must be before lazysizes loads)
@@ -93,6 +94,49 @@ let mode = "manhwa"; // 'manga' or 'manhwa'
 let fileObjects = []; // Array of File objects directly
 let currentIndex = 0; // index for batch loading
 let isBatchLoading = false; // Prevent concurrent loading
+let currentRAF = null; // Track current RAF to cancel on reset
+
+// Unload Observer for Virtual Scrolling / DOM Cleanup
+let unloadObserver = null;
+function initUnloadObserver() {
+  if (unloadObserver) {
+    unloadObserver.disconnect();
+  }
+  unloadObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      const wrapper = entry.target;
+      if (!entry.isIntersecting) {
+        // Scroll out of view: Unload
+        if (!wrapper.classList.contains('is-unloaded') && wrapper._file) {
+          const rect = wrapper.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            // Cache dimensions on wrapper to prevent layout collapse
+            wrapper.style.width = `${rect.width}px`;
+            wrapper.style.height = `${rect.height}px`;
+          }
+          const img = wrapper.querySelector('img');
+          // Revoke memory instantly
+          if (img && img.src && img.src.startsWith('blob:')) {
+            URL.revokeObjectURL(img.src);
+            objectURLs.delete(img.src);
+          }
+          wrapper.innerHTML = ''; // Clear DOM nodes
+          wrapper.classList.add('is-unloaded');
+        }
+      } else {
+        // Scrolled back into view: Reload
+        if (wrapper.classList.contains('is-unloaded') && wrapper._file) {
+          wrapper.classList.remove('is-unloaded');
+          const inner = createInnerElement(wrapper._file);
+          wrapper.appendChild(inner);
+        }
+      }
+    });
+  }, {
+    root: mainBody,
+    rootMargin: "3000px" // Only unload items further than 3000px offscreen
+  });
+}
 
 // modal state
 let currentModalIndex = -1;
@@ -109,11 +153,10 @@ let dragStartX = 0;
 let dragStartY = 0;
 
 // allowed extensions
-const ALLOWED_EXT = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".svg"];
+const extRegex = /\.(jpg|jpeg|png|webp|gif|bmp|svg)$/i;
 
 function isImageName(name) {
-  const lower = name.toLowerCase();
-  return ALLOWED_EXT.some((ext) => lower.endsWith(ext));
+  return extRegex.test(name);
 }
 
 const sidebar = document.getElementById("sidebar");
@@ -141,24 +184,24 @@ document.addEventListener("click", (e) => {
   }
 });
 
+// Context Menu elements (declared in outer scope so they're accessible everywhere)
+const contextMenu = document.getElementById("contextMenu");
+const ctxOpen = document.getElementById("ctxOpen");
+const ctxSetRoot = document.getElementById("ctxSetRoot");
+let activeCtxNode = null;
+
+// Global hide context menu
+document.addEventListener("click", () => {
+  if (contextMenu) contextMenu.style.display = "none";
+});
+document.addEventListener("scroll", () => {
+  if (contextMenu) contextMenu.style.display = "none";
+});
+
 // Sidebar Resize Logic
 const resizer = document.getElementById("sidebarResizer");
 if (resizer) {
   let isResizing = false;
-
-  // Context Menu elements
-  const contextMenu = document.getElementById("contextMenu");
-  const ctxOpen = document.getElementById("ctxOpen");
-  const ctxSetRoot = document.getElementById("ctxSetRoot");
-  let activeCtxNode = null;
-
-  // Global hide context menu
-  document.addEventListener("click", () => {
-    if (contextMenu) contextMenu.style.display = "none";
-  });
-  document.addEventListener("scroll", () => {
-    if (contextMenu) contextMenu.style.display = "none";
-  });
 
   // Restore saved width
   const savedWidth = localStorage.getItem("sidebarWidth");
@@ -208,6 +251,36 @@ if (resizer) {
     ).getPropertyValue("--sidebar-width");
     localStorage.setItem("sidebarWidth", parseInt(currentWidth));
   }
+}
+
+// Reload Folder Action
+const sidebarReload = document.getElementById("sidebarReload");
+if (sidebarReload) {
+  sidebarReload.addEventListener("click", async () => {
+    if (!currentFolderHandle) return;
+
+    const svg = sidebarReload.querySelector("svg");
+    if (svg) {
+      svg.style.transition = "transform 0.5s ease";
+      svg.style.transform = "rotate(360deg)";
+      setTimeout(() => {
+        svg.style.transition = "none";
+        svg.style.transform = "rotate(0deg)";
+      }, 500);
+    }
+
+    const savedSubfolder = currentSubfolder;
+    await handleDirectoryHandle(currentFolderHandle);
+
+    if (savedSubfolder) {
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      const btns = Array.from(sidebar.querySelectorAll(".folder-btn"));
+      const targetBtn = btns.find(b => b.textContent.trim() === savedSubfolder);
+      if (targetBtn) {
+        targetBtn.click();
+      }
+    }
+  });
 }
 
 // Context Menu Actions
@@ -339,9 +412,10 @@ async function renderSidebarTree() {
   // Nút cho folder gốc
   const rootBtn = document.createElement("button");
   const rootSpan = document.createElement("span");
-  rootSpan.textContent = "Root Folder";
+  rootSpan.textContent = currentFolderHandle.name || "Root Folder";
   rootSpan.className = "folder-name";
   rootBtn.appendChild(rootSpan);
+  rootBtn._folderHandle = currentFolderHandle;
   rootBtn.className =
     "folder-btn" + (currentSubfolder === null ? " active" : "");
 
@@ -355,7 +429,7 @@ async function renderSidebarTree() {
   };
 
   rootBtn.oncontextmenu = (e) =>
-    showContextMenu(e, { name: "Root Folder", handle: currentFolderHandle });
+    showContextMenu(e, { name: currentFolderHandle.name || "Root Folder", handle: currentFolderHandle });
 
   rootWrapper.appendChild(rootBtn);
 
@@ -383,6 +457,7 @@ function renderTreeNodes(nodes, container) {
     span.textContent = node.name;
     span.className = "folder-name";
     btn.appendChild(span);
+    btn._folderHandle = node.handle;
     btn.className = "folder-btn";
 
     // Container cho children (ẩn mặc định)
@@ -449,27 +524,70 @@ chooseLabel.addEventListener("click", (e) => {
   openDirectoryPicker();
 });
 
-// fallback input handling (non-recursive: keep files that are at root level of chosen directory)
-chooseInput.addEventListener("change", (e) => {
-  const files = Array.from(e.target.files || []);
-  let root = "";
-  if (files.length && files[0].webkitRelativePath) {
-    const parts = files[0].webkitRelativePath.split("/");
-    root = parts[0];
+/* ---------- Virtual File System for Fallbacks ---------- */
+class VirtualDirHandle {
+  constructor(name) {
+    this.name = name;
+    this.kind = "directory";
+    this.children = new Map();
   }
-  fileObjects = [];
+  async *entries() {
+    for (const [name, handle] of this.children.entries()) {
+      yield [name, handle];
+    }
+  }
+}
+
+class VirtualFileHandle {
+  constructor(file) {
+    this.name = file.name;
+    this.kind = "file";
+    this.file = file;
+  }
+  async getFile() {
+    return this.file;
+  }
+}
+
+function buildVirtualFileSystem(files) {
+  let rootName = "Root Folder";
+  if (files.length && files[0].webkitRelativePath) {
+    rootName = files[0].webkitRelativePath.split("/")[0];
+  }
+  const rootHandle = new VirtualDirHandle(rootName);
+
   files.forEach((f) => {
     if (!isImageName(f.name)) return;
     const rel = f.webkitRelativePath || f.name;
     const parts = rel.split("/");
-    if (parts.length === 1 || (parts.length === 2 && parts[0] === root)) {
-      fileObjects.push(f);
+    
+    // Only file name, put at root
+    if (parts.length === 1) {
+      rootHandle.children.set(f.name, new VirtualFileHandle(f));
+      return;
     }
+    
+    let current = rootHandle;
+    for (let i = 1; i < parts.length - 1; i++) {
+      const dirName = parts[i];
+      if (!current.children.has(dirName)) {
+        current.children.set(dirName, new VirtualDirHandle(dirName));
+      }
+      current = current.children.get(dirName);
+    }
+    current.children.set(f.name, new VirtualFileHandle(f));
   });
-  // Sắp xếp theo tên file để đảm bảo thứ tự đúng
-  fileObjects.sort((a, b) => a.name.localeCompare(b.name));
-  resetAndLoad();
-  sidebar.classList.add("open");
+
+  return rootHandle;
+}
+
+// fallback input handling (recursive via virtual handles)
+chooseInput.addEventListener("change", async (e) => {
+  const files = Array.from(e.target.files || []);
+  if (files.length === 0) return;
+  
+  const rootHandle = buildVirtualFileSystem(files);
+  await handleDirectoryHandle(rootHandle);
 });
 
 // Secondary folder input for drop zone button
@@ -565,84 +683,71 @@ async function handleDrop(e) {
   }
 }
 
-// Read directory using FileSystem API (webkit)
+// Read all entries from a directory entry reader (handles batched reads)
+async function readAllEntriesFromReader(reader) {
+  const entries = [];
+  let continueReading = true;
+  while (continueReading) {
+    await new Promise((resolve, reject) => {
+      reader.readEntries(
+        (results) => {
+          if (results.length === 0) {
+            continueReading = false;
+          } else {
+            entries.push(...results);
+          }
+          resolve();
+        },
+        (err) => {
+          console.error("Error reading entries", err);
+          reject(err);
+        },
+      );
+    });
+  }
+  return entries;
+}
+
+class FileSystemEntryDirHandle {
+  constructor(dirEntry) {
+    this.name = dirEntry.name;
+    this.kind = "directory";
+    this.dirEntry = dirEntry;
+  }
+  async *entries() {
+    const reader = this.dirEntry.createReader();
+    const entries = await readAllEntriesFromReader(reader);
+    for (const entry of entries) {
+      if (entry.isFile) {
+        yield [entry.name, new FileSystemEntryFileHandle(entry)];
+      } else if (entry.isDirectory) {
+        yield [entry.name, new FileSystemEntryDirHandle(entry)];
+      }
+    }
+  }
+}
+
+class FileSystemEntryFileHandle {
+  constructor(fileEntry) {
+    this.name = fileEntry.name;
+    this.kind = "file";
+    this.fileEntry = fileEntry;
+  }
+  async getFile() {
+    return new Promise((resolve, reject) => {
+      this.fileEntry.file(resolve, reject);
+    });
+  }
+}
+
+// Read directory using FileSystem API (webkit) — lazily builds tree then delegates
 async function readDirectoryEntry(dirEntry) {
   console.log("Reading directory entry:", dirEntry.name);
-  fileObjects = [];
-
-  const reader = dirEntry.createReader();
-  const entries = [];
-
-  // Robustly read all entries by looping until no more are returned
-  const readAllEntries = async () => {
-    let continueReading = true;
-    while (continueReading) {
-      await new Promise((resolve, reject) => {
-        reader.readEntries(
-          (results) => {
-            if (results.length === 0) {
-              continueReading = false;
-              resolve();
-            } else {
-              entries.push(...results);
-              resolve();
-            }
-          },
-          (err) => {
-            console.error("Error reading entries", err);
-            reject(err);
-          },
-        );
-      });
-    }
-  };
-
   try {
-    await readAllEntries();
-
-    // Filter for files directly
-    const fileEntries = entries.filter((e) => e.isFile);
-
-    // Convert FileEntry to File objects
-    const filePromises = fileEntries.map((entry) => {
-      return new Promise((resolve) => {
-        entry.file(
-          (file) => {
-            // Double check checking extension here as well
-            if (isImageName(file.name)) {
-              resolve(file);
-            } else {
-              resolve(null);
-            }
-          },
-          (err) => {
-            console.warn("Failed to get file from entry", entry.name, err);
-            resolve(null);
-          },
-        );
-      });
-    });
-
-    const files = await Promise.all(filePromises);
-    // Filter out nulls
-    const validFiles = files.filter((f) => f !== null);
-
-    if (validFiles.length > 0) {
-      fileObjects = validFiles;
-      fileObjects.sort((a, b) => a.name.localeCompare(b.name));
-
-      // Also update the sidebar tree if possible?
-      // For now, let's just show the gallery as requested.
-      // We might want to fake a root folder handle or just load the images.
-      // The original logic just loaded images.
-
-      resetAndLoad();
-      sidebar.classList.add("open");
-    } else {
-      // Maybe show alert?
-    }
+    const virtualRoot = new FileSystemEntryDirHandle(dirEntry);
+    await handleDirectoryHandle(virtualRoot);
   } catch (err) {
-    console.warn("Error processing directory:", err); // Keep essential warnings
+    console.warn("Error processing directory:", err);
   }
 }
 
@@ -703,6 +808,15 @@ thumbSizeSelect.addEventListener("change", (e) => {
 function resetAndLoad() {
   // Stop any ongoing continuous loading
   stopContinuousLoading();
+
+  if (currentRAF) {
+    cancelAnimationFrame(currentRAF);
+    currentRAF = null;
+  }
+  isBatchLoading = false;
+
+  // Initialize virtual unload observer
+  initUnloadObserver();
 
   // Revoke all Object URLs to free memory
   objectURLs.forEach((url) => URL.revokeObjectURL(url));
@@ -819,84 +933,78 @@ async function renderThumbnailToCanvas(file, canvas) {
   }
 }
 
-// Helper: Create item element (Canvas for Manga, Img for Manhwa)
-function createItemElement(file, onClick = null) {
+// Helper: Create inner element (canvas/img) attached via unload observer
+function createInnerElement(file) {
   if (mode === "manhwa") {
-    // For Manhwa, we usually want full quality or at least width-based.
-    // Since Manhwa is vertical scroll, let's use standard IMG with Blob URL for now,
-    // OR we can use Canvas if performance is still bad.
-    // Given "performance is bad", let's try Canvas for Manhwa too, but with higher width cap?
-    // Actually, Manhwa strips are often long. createImageBitmap might fail if too long.
-    // Let's stick to Blob URL for Manhwa but lazy load strictly.
-    // Optimization: Manhwa mode often needs full width.
-
-    const wrapper = document.createElement("div");
-    wrapper.className = "manhwa-item";
-
     const img = document.createElement("img");
     img.alt = file.name;
-    // img.loading = "lazy"; // Removed native lazy loading
-    // img.decoding = "async"; // Removed explicit decoding, let browser/lib handle
-    img.classList.add("lazyload"); // Add lazysizes class
-    img.classList.add("skeleton-loading");
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.classList.add("lazyload", "skeleton-loading");
+    img.src = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
+    img._file = file;
+    img.dataset.src = "about:blank";
 
-    // Use transparent placeholder to prevent broken image icon
-    img.src =
-      "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
-
-    const url = URL.createObjectURL(file);
-    objectURLs.add(url); // Track for memory cleanup
-    img.dataset.src = url; // Use data-src for lazysizes
-
-    // Clean up URL when image unloads? Hard with simple DOM.
-    // For now, rely on browser GC or manual cleanup if we implement virtualization.
-
-    // Listen for lazysizes lazyloaded event
     img.addEventListener("lazyloaded", () => {
       img.classList.remove("skeleton-loading");
+      // Remove hardcoded wrapper height once loaded to allow natural resize
+      if (img.parentElement) {
+        img.parentElement.style.height = ''; 
+      }
     });
 
     const targetWidth = `${window.innerWidth * (maxWidthVW / 100)}px`;
     img.style.width = targetWidth;
     img.style.height = "auto";
-
-    wrapper.appendChild(img);
-    return wrapper;
+    return img;
   } else {
-    // Manga Mode: Grid of thumbnails. USE CANVAS.
-    const wrapper = document.createElement("div");
-    wrapper.className = "gallery-item";
-
     const canvas = document.createElement("canvas");
-    canvas.classList.add("lazyload"); // Use lazysizes
-    canvas.classList.add("skeleton-loading"); // Show skeleton while loading
-    canvas.file = file; // Attach file for lazy loading
+    canvas.classList.add("lazyload", "skeleton-loading");
+    canvas.file = file;
 
-    // Set cached dimensions if available to prevent layout shift
     if (imageDimensionsCache.has(file.name)) {
       const dims = imageDimensionsCache.get(file.name);
       canvas.width = dims.width;
       canvas.height = dims.height;
     } else {
-      // Default placeholder dimensions to prevent layout shift
       canvas.width = 200;
       canvas.height = 280;
     }
-
-    if (onClick) {
-      wrapper.addEventListener("click", onClick);
-    }
-
-    wrapper.appendChild(canvas);
-    return wrapper;
+    return canvas;
   }
 }
 
-// Lazysizes hook for canvas
+// Helper: Create item element (Canvas for Manga, Img for Manhwa)
+function createItemElement(file, onClick = null) {
+  const wrapper = document.createElement("div");
+  wrapper.className = mode === "manhwa" ? "manhwa-item" : "gallery-item";
+  wrapper._file = file; // Store reference for unloader
+
+  if (onClick) {
+    wrapper.addEventListener("click", onClick);
+  }
+
+  const inner = createInnerElement(file);
+  wrapper.appendChild(inner);
+
+  if (unloadObserver) {
+    unloadObserver.observe(wrapper);
+  }
+
+  return wrapper;
+}
+
+// Lazysizes hook for canvas AND deferred Object URL creation for img
 document.addEventListener("lazybeforeunveil", function (e) {
   var target = e.target;
   if (target.tagName === "CANVAS" && target.file) {
     renderThumbnailToCanvas(target.file, target);
+  } else if (target.tagName === "IMG" && target._file) {
+    // Create Object URL just-in-time when lazysizes is about to unveil
+    var url = URL.createObjectURL(target._file);
+    objectURLs.add(url);
+    target.dataset.src = url;
+    target._file = null; // Release File reference
   }
 });
 
@@ -924,6 +1032,7 @@ function loadInitialImages() {
     const fragment = document.createDocumentFragment();
     for (let i = chunkStart; i < chunkEnd; i++) {
       const file = fileObjects[i];
+      if (!file) continue; // Defensive check
       const item = createItemElement(file, () => openModalWithItem(file));
       fragment.appendChild(item);
     }
@@ -933,7 +1042,7 @@ function loadInitialImages() {
 
     // Schedule next chunk
     if (chunkStart < initialCount) {
-      requestAnimationFrame(loadChunk);
+      currentRAF = requestAnimationFrame(loadChunk);
     } else {
       currentIndex = initialCount;
       // Start continuous time-based loading for remaining images
@@ -944,7 +1053,7 @@ function loadInitialImages() {
   }
 
   // Start loading
-  requestAnimationFrame(loadChunk);
+  currentRAF = requestAnimationFrame(loadChunk);
 }
 
 // Load more images for infinite scroll
@@ -969,6 +1078,7 @@ function loadMoreImages() {
     const fragment = document.createDocumentFragment();
     for (let i = chunkStart; i < chunkEnd; i++) {
       const file = fileObjects[i];
+      if (!file) continue; // Defensive check
       const item = createItemElement(file, () => openModalWithItem(file));
       fragment.appendChild(item);
     }
@@ -977,42 +1087,63 @@ function loadMoreImages() {
     chunkStart = chunkEnd;
 
     if (chunkStart < batchEnd) {
-      requestAnimationFrame(loadChunk);
+      currentRAF = requestAnimationFrame(loadChunk);
     } else {
       currentIndex = batchEnd;
       isBatchLoading = false;
     }
   }
 
-  requestAnimationFrame(loadChunk);
+  currentRAF = requestAnimationFrame(loadChunk);
 }
 
-/* Time-based continuous loading */
-let continuousLoadInterval = null;
-const LOAD_INTERVAL_MS = 500; // Load new batch every 500ms
+/* Time-based auto-loading + scroll-triggered loading */
+let sentinelObserver = null;
+let autoLoadTimer = null;
+const AUTO_LOAD_INTERVAL = 500; // ms between auto-load batches
 
 function startContinuousLoading() {
-  // Clear any existing interval
+  // Stop any existing loaders
   stopContinuousLoading();
 
-  // Start loading at regular intervals
-  continuousLoadInterval = setInterval(() => {
-    if (currentIndex >= fileObjects.length) {
-      // All images loaded, stop the interval
-      stopContinuousLoading();
-      return;
-    }
-
-    requestAnimationFrame(() => {
+  // 1. Time-based auto-loading: load batches at intervals regardless of scroll
+  autoLoadTimer = setInterval(() => {
+    if (!isBatchLoading && currentIndex < fileObjects.length) {
       loadMoreImages();
-    });
-  }, LOAD_INTERVAL_MS);
+    }
+    // Stop timer when all images are loaded
+    if (currentIndex >= fileObjects.length) {
+      clearInterval(autoLoadTimer);
+      autoLoadTimer = null;
+    }
+  }, AUTO_LOAD_INTERVAL);
+
+  // 2. Scroll-triggered loading: also load immediately when user scrolls near bottom
+  const sentinel = document.getElementById("sentinel");
+  if (!sentinel) return;
+
+  sentinelObserver = new IntersectionObserver(
+    (entries) => {
+      if (entries[0].isIntersecting && !isBatchLoading && currentIndex < fileObjects.length) {
+        loadMoreImages();
+      }
+    },
+    {
+      root: document.getElementById("mainBody"),
+      rootMargin: "600px",
+    },
+  );
+  sentinelObserver.observe(sentinel);
 }
 
 function stopContinuousLoading() {
-  if (continuousLoadInterval) {
-    clearInterval(continuousLoadInterval);
-    continuousLoadInterval = null;
+  if (autoLoadTimer) {
+    clearInterval(autoLoadTimer);
+    autoLoadTimer = null;
+  }
+  if (sentinelObserver) {
+    sentinelObserver.disconnect();
+    sentinelObserver = null;
   }
 }
 
@@ -1221,37 +1352,141 @@ modalImage.addEventListener("mousedown", (e) => {
   dragStartX = e.clientX - translateX;
   dragStartY = e.clientY - translateY;
   modalImage.style.cursor = "grabbing";
+
+  window.addEventListener("mousemove", onMouseMove, { passive: true });
+  window.addEventListener("mouseup", onMouseUp);
 });
 
 // kéo
-window.addEventListener(
-  "mousemove",
-  (e) => {
-    if (!zoomed || !isDragging) return;
-    translateX = e.clientX - dragStartX;
-    translateY = e.clientY - dragStartY;
-    modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
-  },
-  { passive: true },
-);
+function onMouseMove(e) {
+  if (!zoomed || !isDragging) return;
+  translateX = e.clientX - dragStartX;
+  translateY = e.clientY - dragStartY;
+  modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
+}
 
 // kết thúc drag
-window.addEventListener("mouseup", () => {
+function onMouseUp() {
   if (!zoomed) return;
   isDragging = false;
   modalImage.style.cursor = "grab";
-});
+  
+  window.removeEventListener("mousemove", onMouseMove);
+  window.removeEventListener("mouseup", onMouseUp);
+}
 
 // prev/next buttons
 prevBtn.addEventListener("click", () => navigateModal(-1));
 nextBtn.addEventListener("click", () => navigateModal(1));
 
+let arrowScrollVelocity = 0;
+let arrowScrollRAF = null;
+const ARROW_SCROLL_SPEED = 30; // Pixels per frame for continuous scroll
+
+function arrowContinuousScroll() {
+  if (arrowScrollVelocity !== 0) {
+    mainBody.scrollTop += arrowScrollVelocity;
+    arrowScrollRAF = requestAnimationFrame(arrowContinuousScroll);
+  } else {
+    arrowScrollRAF = null;
+  }
+}
+
 window.addEventListener("keydown", (e) => {
-  if (!modal.classList.contains("active")) return;
-  if (e.key === "ArrowRight") navigateModal(1);
-  else if (e.key === "ArrowLeft") navigateModal(-1);
-  else if (e.key === "Escape") closeModal();
+  // Skip if focused on input elements
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.target.tagName === "TEXTAREA") return;
+
+  if (modal.classList.contains("active")) {
+    // Modal navigation
+    if (e.key === "ArrowRight") navigateModal(1);
+    else if (e.key === "ArrowLeft") navigateModal(-1);
+    else if (e.key === "Escape") closeModal();
+  } else {
+    // Folder navigation (when modal is not open)
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      navigateToSiblingFolder(-1);
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      navigateToSiblingFolder(1);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (e.repeat) {
+        arrowScrollVelocity = -ARROW_SCROLL_SPEED;
+        if (!arrowScrollRAF) arrowContinuousScroll();
+      } else {
+        mainBody.scrollBy({ top: -400, behavior: "smooth" });
+      }
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (e.repeat) {
+        arrowScrollVelocity = ARROW_SCROLL_SPEED;
+        if (!arrowScrollRAF) arrowContinuousScroll();
+      } else {
+        mainBody.scrollBy({ top: 400, behavior: "smooth" });
+      }
+    }
+  }
 });
+
+window.addEventListener("keyup", (e) => {
+  if (e.key === "ArrowUp" && arrowScrollVelocity < 0) {
+    arrowScrollVelocity = 0;
+  } else if (e.key === "ArrowDown" && arrowScrollVelocity > 0) {
+    arrowScrollVelocity = 0;
+  }
+});
+
+// Check if a folder handle contains at least one image file
+async function folderHasImages(handle) {
+  try {
+    for await (const [name, entry] of handle.entries()) {
+      if (entry.kind === "file" && isImageName(name)) return true;
+    }
+  } catch (err) {
+    console.warn("Error checking folder for images:", err);
+  }
+  return false;
+}
+
+// Navigate to previous/next sibling folder containing images
+// If no sibling with images at current level, go up to parent's siblings
+async function navigateToSiblingFolder(direction) {
+  const activeBtn = sidebar.querySelector(".folder-btn.active");
+  if (!activeBtn) return;
+
+  let folderNode = activeBtn.closest(".folder-node");
+
+  while (folderNode) {
+    const container = folderNode.parentElement;
+    // Stop if we've reached the sidebar-content (root has no siblings)
+    if (!container || container.classList.contains("sidebar-content")) break;
+
+    // Get all sibling folder-node elements at this level
+    const siblings = Array.from(
+      container.querySelectorAll(":scope > .folder-node"),
+    );
+    const currentIndex = siblings.indexOf(folderNode);
+
+    // Search siblings in the given direction
+    let nextIndex = currentIndex + direction;
+    while (nextIndex >= 0 && nextIndex < siblings.length) {
+      const candidateNode = siblings[nextIndex];
+      const candidateBtn = candidateNode.querySelector(":scope > .folder-btn");
+      if (candidateBtn && candidateBtn._folderHandle) {
+        const hasImages = await folderHasImages(candidateBtn._folderHandle);
+        if (hasImages) {
+          candidateBtn.click();
+          return;
+        }
+      }
+      nextIndex += direction;
+    }
+
+    // No valid sibling found at this level — go up to parent
+    folderNode = container.closest(".folder-node");
+  }
+}
 
 function navigateModal(delta) {
   if (fileObjects.length === 0) return;
