@@ -6,8 +6,11 @@
 - Gallery thumbnails uniform size via .gallery-item & object-fit: cover
 - Infinite scroll with IntersectionObserver on #sentinel + requestAnimationFrame
 - Batch size fixed = 20
-- Performance Optimization: Uses createImageBitmap for thumbnails, Canvas for rendering
-- Deferred Object URL creation: URLs created at unveil time, not at DOM insertion
+- Performance Optimization:
+    - createImageBitmap + canvas for Manga thumbnails
+    - Custom visibility-based loader + decoded blob cache for Manhwa (prioritizes back-scroll smoothness)
+    - Deferred Object URL creation + 8s delayed unload with generous cache for ~50 image folders
+- Temporary debug metrics: window.__imgDebug (enable with .enabled = true, use .getStats())
 */
 
 // Configure lazysizes for fast scrolling (must be before lazysizes loads)
@@ -17,6 +20,145 @@ window.lazySizesConfig.expFactor = 1.5; // Expansion factor during idle
 window.lazySizesConfig.hFac = 0.8; // Height factor for horizontal scroll
 window.lazySizesConfig.loadMode = 2; // Load images in view + nearby
 window.lazySizesConfig.throttleDelay = 125; // Throttle scroll events
+
+// === Temporary Performance Debug Instrumentation (Manhwa optimization focus) ===
+// Enable with:  window.__imgDebug.enabled = true
+// View live stats: window.__imgDebug
+// Reset with:   window.__imgDebug.reset()
+const __imgDebug = {
+  enabled: false,
+  liveBlobs: 0,
+  totalCreated: 0,
+  totalRevoked: 0,
+  manhwaDecodes: 0,
+  unloads: 0,
+  reloads: 0,
+  cacheHits: 0,
+  cacheMisses: 0,
+  activeURLs: new Set(),
+
+  _updateLive() {
+    this.liveBlobs = this.activeURLs.size;
+  },
+
+  log(msg, data) {
+    if (this.enabled) {
+      console.log(`[ImgPerf] ${msg}`, data || '');
+    }
+  },
+
+  recordCreate(url, isManhwa = false) {
+    this.totalCreated++;
+    this.activeURLs.add(url);
+    this._updateLive();
+    if (isManhwa) this.manhwaDecodes++;
+    this.log('Blob created', { live: this.liveBlobs, total: this.totalCreated, isManhwa });
+  },
+
+  recordRevoke(url) {
+    this.totalRevoked++;
+    this.activeURLs.delete(url);
+    this._updateLive();
+    this.log('Blob revoked', { live: this.liveBlobs, totalRevoked: this.totalRevoked });
+  },
+
+  recordUnload() {
+    this.unloads++;
+    this.log('Image unloaded (DOM cleared)', { unloads: this.unloads, liveBlobs: this.liveBlobs });
+  },
+
+  recordReload(isCacheHit = false) {
+    this.reloads++;
+    if (isCacheHit) this.cacheHits++; else this.cacheMisses++;
+    this.log('Image reloaded', { reloads: this.reloads, hits: this.cacheHits, misses: this.cacheMisses });
+  },
+
+  reset() {
+    this.liveBlobs = 0;
+    this.totalCreated = 0;
+    this.totalRevoked = 0;
+    this.manhwaDecodes = 0;
+    this.unloads = 0;
+    this.reloads = 0;
+    this.cacheHits = 0;
+    this.cacheMisses = 0;
+    this.activeURLs.clear();
+    this.log('Debug stats reset');
+  },
+
+  getStats() {
+    return {
+      liveBlobs: this.liveBlobs,
+      renderedImages: renderedImages.size,
+      manhwaCacheSize: manhwaImageCache.size,
+      totalCreated: this.totalCreated,
+      totalRevoked: this.totalRevoked,
+      unloads: this.unloads,
+      reloads: this.reloads,
+      cacheHits: this.cacheHits,
+      cacheMisses: this.cacheMisses,
+      manhwaDecodes: this.manhwaDecodes
+    };
+  }
+};
+
+window.__imgDebug = __imgDebug;
+// === End Debug Instrumentation ===
+
+// === Manhwa Image Cache (Phase 2) - prioritizes back-scroll smoothness for ~50 images ===
+// Keeps recently decoded blob URLs alive so scrolling back is near-instant.
+const manhwaImageCache = new Map(); // filename -> {url, lastUsed}
+const MAX_MANHWA_CACHE_SIZE = 28; // Generous for target size + smoothness priority
+
+function getCachedManhwaURL(file) {
+  const entry = manhwaImageCache.get(file.name);
+  if (entry) {
+    entry.lastUsed = Date.now();
+    __imgDebug.cacheHits++;
+    __imgDebug.log('Cache HIT for Manhwa image', file.name);
+    return entry.url;
+  }
+  __imgDebug.cacheMisses++;
+  return null;
+}
+
+function cacheManhwaURL(file, url) {
+  // Evict oldest if over limit
+  if (manhwaImageCache.size >= MAX_MANHWA_CACHE_SIZE) {
+    let oldestKey = null;
+    let oldestTime = Infinity;
+    for (const [key, val] of manhwaImageCache) {
+      if (val.lastUsed < oldestTime) {
+        oldestTime = val.lastUsed;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey) {
+      const oldEntry = manhwaImageCache.get(oldestKey);
+      if (oldEntry) {
+        __imgDebug.recordRevoke(oldEntry.url);
+        URL.revokeObjectURL(oldEntry.url);
+        objectURLs.delete(oldEntry.url);
+      }
+      manhwaImageCache.delete(oldestKey);
+    }
+  }
+
+  manhwaImageCache.set(file.name, { url, lastUsed: Date.now() });
+  __imgDebug.log('Cached Manhwa image', file.name);
+}
+
+function clearManhwaCache() {
+  for (const [key, entry] of manhwaImageCache) {
+    __imgDebug.recordRevoke(entry.url);
+    URL.revokeObjectURL(entry.url);
+    objectURLs.delete(entry.url);
+  }
+  manhwaImageCache.clear();
+  __imgDebug.log('Manhwa cache cleared');
+}
+
+// === End Manhwa Cache ===
 
 const chooseInput = document.getElementById("chooseFolder");
 const chooseLabel = document.getElementById("chooseLabel");
@@ -125,11 +267,23 @@ function initUnloadObserver() {
               }
               const img = wrapper.querySelector('img');
               if (img && img.src && img.src.startsWith('blob:')) {
-                URL.revokeObjectURL(img.src);
-                objectURLs.delete(img.src);
+                // For Manhwa: move to cache instead of revoking (smoothness priority)
+                if (mode === "manhwa" && wrapper._file) {
+                  if (!manhwaImageCache.has(wrapper._file.name)) {
+                    cacheManhwaURL(wrapper._file, img.src);
+                  }
+                  // Keep the blob alive in cache; do not revoke here
+                  objectURLs.delete(img.src); // still remove from bulk tracking
+                } else {
+                  __imgDebug.recordRevoke(img.src);
+                  URL.revokeObjectURL(img.src);
+                  objectURLs.delete(img.src);
+                }
               }
               wrapper.innerHTML = '';
               wrapper.classList.add('is-unloaded');
+              renderedImages.delete(wrapper);
+              __imgDebug.recordUnload();
             }, UNLOAD_DELAY);
             pendingUnloads.set(wrapper, timerId);
           }
@@ -145,6 +299,14 @@ function initUnloadObserver() {
           wrapper.classList.remove('is-unloaded');
           const inner = createInnerElement(wrapper._file);
           wrapper.appendChild(inner);
+          if (mode === "manhwa" && manhwaLoadObserver) {
+            manhwaLoadObserver.observe(wrapper);
+          }
+          // Immediately try to load (will hit cache for fast back-scroll)
+          if (mode === "manhwa") {
+            ensureManhwaImageLoaded(wrapper);
+          }
+          __imgDebug.recordReload(!!(wrapper._file && manhwaImageCache.has(wrapper._file.name)));
         }
       }
     });
@@ -152,6 +314,73 @@ function initUnloadObserver() {
     root: mainBody,
     rootMargin: "5000px" // Larger buffer: only unload items very far offscreen
   });
+}
+
+// Dedicated loader for Manhwa images (replaces lazysizes for this path)
+// Uses IntersectionObserver with generous margin for pre-loading → better back-scroll smoothness
+let manhwaLoadObserver = null;
+
+function initManhwaLoadObserver() {
+  if (manhwaLoadObserver) {
+    manhwaLoadObserver.disconnect();
+  }
+
+  manhwaLoadObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        const wrapper = entry.target;
+        ensureManhwaImageLoaded(wrapper);
+      }
+    });
+  }, {
+    root: mainBody,
+    rootMargin: "1200px 0px", // Preload well ahead for smooth scrolling
+    threshold: 0.01
+  });
+}
+
+function ensureManhwaImageLoaded(wrapper) {
+  if (!wrapper || mode !== "manhwa" || !wrapper._file) return;
+
+  let img = wrapper.querySelector("img");
+
+  // If unloaded or no img, recreate the skeleton placeholder
+  if (!img || wrapper.classList.contains("is-unloaded")) {
+    if (wrapper.classList.contains("is-unloaded")) {
+      wrapper.classList.remove("is-unloaded");
+    }
+    img = createInnerElement(wrapper._file);
+    wrapper.innerHTML = "";
+    wrapper.appendChild(img);
+  }
+
+  // If we still have the file reference (we clear _file after loading the real image), load it now
+  if (img && img._file) {
+    let url = getCachedManhwaURL(img._file);
+
+    if (!url) {
+      // Cache miss → create new
+      url = URL.createObjectURL(img._file);
+      objectURLs.add(url);
+      __imgDebug.recordCreate(url, true);
+      cacheManhwaURL(img._file, url);
+    } else {
+      // Re-use cached URL (no new decode)
+      // Still track in objectURLs for bulk cleanup on clear
+      if (!objectURLs.has(url)) objectURLs.add(url);
+    }
+
+    img.src = url;
+    img._file = null; // Release reference
+
+    // Handle visual state immediately on cache hit (load event may not fire for cached blobs)
+    if (img.complete) {
+      img.classList.remove("skeleton-loading");
+      img.classList.add("lazyloaded");
+      if (img.parentElement) img.parentElement.style.height = '';
+    }
+    // Otherwise the "load" listener will catch it
+  }
 }
 
 // modal state
@@ -175,10 +404,45 @@ function isImageName(name) {
   return extRegex.test(name);
 }
 
+function naturalCompare(a, b) {
+  const aStr = String(a);
+  const bStr = String(b);
+
+  // Extract all numbers appearing in the name (e.g. "Chap514" → [514], "Chap 1" → [1])
+  // This makes "sort by number in name" actually work even when spacing/punctuation differs
+  const aNums = (aStr.match(/\d+/g) || []).map(n => parseInt(n, 10));
+  const bNums = (bStr.match(/\d+/g) || []).map(n => parseInt(n, 10));
+
+  const len = Math.min(aNums.length, bNums.length);
+  for (let i = 0; i < len; i++) {
+    if (aNums[i] !== bNums[i]) {
+      return aNums[i] - bNums[i];
+    }
+  }
+
+  // One name has more numbers than the other
+  if (aNums.length !== bNums.length) {
+    return aNums.length - bNums.length;
+  }
+
+  // Numbers are identical (or none) → fall back to normal string sort
+  return aStr.localeCompare(bStr);
+}
+
+function compareFolderNames(x, y) {
+  const na = x && x.name ? x.name : (typeof x === "string" ? x : "");
+  const nb = y && y.name ? y.name : (typeof y === "string" ? y : "");
+  if (explorerSortMode === "natural") {
+    return naturalCompare(na, nb);
+  }
+  return na.localeCompare(nb);
+}
+
 const sidebar = document.getElementById("sidebar");
 let subfolders = []; // [{name, handle}]
 let currentFolderHandle = null;
 let currentSubfolder = null;
+let explorerSortMode = localStorage.getItem("explorerSortMode") === "natural" ? "natural" : "string";
 
 // Sidebar Trigger Logic
 const sidebarTrigger = document.querySelector(".sidebar-trigger"); // Select via class since it has no ID
@@ -299,6 +563,43 @@ if (sidebarReload) {
   });
 }
 
+// Sidebar Sort Toggle (only affects folder tree in explorer — per user requirement)
+function updateSortButtonUI(btn) {
+  if (!btn) return;
+  if (explorerSortMode === "natural") {
+    btn.textContent = "🔢";
+    btn.title = "Natural sort (by number in name) — click to use A-Z string sort";
+  } else {
+    btn.textContent = "🔤";
+    btn.title = "A-Z string sort — click to use natural sort by number";
+  }
+}
+
+const sidebarSort = document.getElementById("sidebarSort");
+if (sidebarSort) {
+  sidebarSort.addEventListener("click", async () => {
+    explorerSortMode = explorerSortMode === "string" ? "natural" : "string";
+    localStorage.setItem("explorerSortMode", explorerSortMode);
+    updateSortButtonUI(sidebarSort);
+
+    if (currentFolderHandle) {
+      const savedSubfolder = currentSubfolder;
+      await renderSidebarTree();
+
+      if (savedSubfolder) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        const btns = Array.from(sidebar.querySelectorAll(".folder-btn"));
+        const targetBtn = btns.find((b) => b.textContent.trim() === savedSubfolder);
+        if (targetBtn) {
+          targetBtn.click();
+        }
+      }
+    }
+  });
+
+  updateSortButtonUI(sidebarSort);
+}
+
 // Context Menu Actions
 if (ctxOpen) {
   ctxOpen.onclick = () => {
@@ -326,6 +627,7 @@ if (ctxSetRoot) {
 async function handleDirectoryHandle(dirHandle) {
   // Cleanup old URLs
   if (currentFullResUrl) {
+    __imgDebug.recordRevoke(currentFullResUrl);
     URL.revokeObjectURL(currentFullResUrl);
     currentFullResUrl = null;
   }
@@ -348,9 +650,9 @@ async function handleDirectoryHandle(dirHandle) {
       subfolders.push({ name, handle });
     }
   }
-  // Sort by name
+  // Sort by name (files stay string sort; folders use explorer mode)
   fileObjects.sort((a, b) => a.name.localeCompare(b.name));
-  subfolders.sort((a, b) => a.name.localeCompare(b.name));
+  subfolders.sort((a, b) => compareFolderNames(a, b));
 
   await renderSidebarTree();
   resetAndLoad();
@@ -360,6 +662,7 @@ async function handleDirectoryHandle(dirHandle) {
 // Khi chọn folder con, duyệt sâu vào folder đó
 async function handleSubfolderHandle(dirHandle) {
   if (currentFullResUrl) {
+    __imgDebug.recordRevoke(currentFullResUrl);
     URL.revokeObjectURL(currentFullResUrl);
     currentFullResUrl = null;
   }
@@ -389,7 +692,7 @@ async function getSubfolders(dirHandle) {
       folders.push({ name, handle, children: [] }); // children empty initially
     }
   }
-  folders.sort((a, b) => a.name.localeCompare(b.name));
+  folders.sort((a, b) => compareFolderNames(a, b));
   return folders;
 }
 
@@ -834,9 +1137,25 @@ function resetAndLoad() {
   // Initialize virtual unload observer
   initUnloadObserver();
 
+  // Initialize dedicated Manhwa image loader (custom, no lazysizes)
+  if (mode === "manhwa") {
+    initManhwaLoadObserver();
+  } else if (manhwaLoadObserver) {
+    manhwaLoadObserver.disconnect();
+    manhwaLoadObserver = null;
+  }
+
   // Revoke all Object URLs to free memory
-  objectURLs.forEach((url) => URL.revokeObjectURL(url));
+  objectURLs.forEach((url) => {
+    __imgDebug.recordRevoke(url);
+    URL.revokeObjectURL(url);
+  });
   objectURLs.clear();
+
+  // Also clear Manhwa decoded cache on full reset
+  clearManhwaCache();
+
+  renderedImages.clear();
 
   gallery.innerHTML = "";
   currentIndex = 0;
@@ -946,6 +1265,8 @@ async function renderThumbnailToCanvas(file, canvas) {
     console.error("Error generating thumbnail for", file.name, err);
     canvas.classList.remove("skeleton-loading");
     // Show error state visually if needed
+  } finally {
+    // Note: actual decode happens here via createImageBitmap
   }
 }
 
@@ -956,17 +1277,20 @@ function createInnerElement(file) {
     img.alt = file.name;
     img.loading = "lazy";
     img.decoding = "async";
-    img.classList.add("lazyload", "skeleton-loading");
+    img.classList.add("skeleton-loading"); // No longer using lazysizes for Manhwa
+    // Start with a tiny placeholder (prevents broken image icon)
     img.src = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
     img._file = file;
-    img.dataset.src = "about:blank";
 
-    img.addEventListener("lazyloaded", () => {
+    // Native load handler (replaces lazyloaded event from lazysizes)
+    img.addEventListener("load", () => {
       img.classList.remove("skeleton-loading");
-      // Remove hardcoded wrapper height once loaded to allow natural resize
+      // Remove temporary wrapper height once loaded
       if (img.parentElement) {
-        img.parentElement.style.height = ''; 
+        img.parentElement.style.height = '';
       }
+      // Mark as loaded for potential CSS hooks
+      img.classList.add("lazyloaded");
     });
 
     const targetWidth = `${window.innerWidth * (maxWidthVW / 100)}px`;
@@ -1007,6 +1331,16 @@ function createItemElement(file, onClick = null) {
     unloadObserver.observe(wrapper);
   }
 
+  // For Manhwa: also observe with dedicated load observer for controlled unveiling
+  if (mode === "manhwa" && manhwaLoadObserver) {
+    manhwaLoadObserver.observe(wrapper);
+    // Ensure items that are already intersecting (or within rootMargin) actually load.
+    // IntersectionObserver callback is not guaranteed to fire for elements that
+    // are already intersecting at the moment .observe() is called.
+    ensureManhwaImageLoaded(wrapper);
+  }
+
+  renderedImages.add(wrapper);
   return wrapper;
 }
 
@@ -1019,6 +1353,7 @@ document.addEventListener("lazybeforeunveil", function (e) {
     // Create Object URL just-in-time when lazysizes is about to unveil
     var url = URL.createObjectURL(target._file);
     objectURLs.add(url);
+    __imgDebug.recordCreate(url, true); // Manhwa full-res image
     target.dataset.src = url;
     target._file = null; // Release File reference
   }
@@ -1161,6 +1496,9 @@ function stopContinuousLoading() {
     sentinelObserver.disconnect();
     sentinelObserver = null;
   }
+  // Note: Do NOT touch manhwaLoadObserver here.
+  // It is managed exclusively in resetAndLoad() / initManhwaLoadObserver().
+  // Killing it here broke loading for images added via continuous loading.
 }
 
 /* ---------- Clear ---------- */
@@ -1169,6 +1507,7 @@ clearBtn.addEventListener("click", () => {
   stopContinuousLoading();
 
   if (currentFullResUrl) {
+    __imgDebug.recordRevoke(currentFullResUrl);
     URL.revokeObjectURL(currentFullResUrl);
     currentFullResUrl = null;
   }
@@ -1183,6 +1522,8 @@ clearBtn.addEventListener("click", () => {
 
   gallery.innerHTML = "";
   currentIndex = 0;
+
+  clearManhwaCache();
   showEmptyState();
 });
 
@@ -1204,6 +1545,7 @@ function openModalWithItem(file) {
 function loadModalImage(file) {
   // Revoke previous URL to save memory
   if (currentFullResUrl) {
+    __imgDebug.recordRevoke(currentFullResUrl);
     URL.revokeObjectURL(currentFullResUrl);
   }
 
@@ -1211,6 +1553,7 @@ function loadModalImage(file) {
 
   // Create new URL for full res
   currentFullResUrl = URL.createObjectURL(file);
+  __imgDebug.recordCreate(currentFullResUrl, false); // Modal full-res
   modalImage.src = currentFullResUrl;
 
   modalImage.onload = () => {
@@ -1609,6 +1952,7 @@ if (savedPinState === "true") {
   sidebar.classList.add("pinned");
   sidebarPin.classList.add("pinned");
   sidebarPin.title = "Unpin Sidebar";
+  document.body.classList.add("sidebar-pinned");
 }
 
 sidebarPin.addEventListener("click", () => {
@@ -1624,9 +1968,10 @@ sidebarPin.addEventListener("click", () => {
     sidebarPin.title = "Pin Sidebar";
   }
 
-  // Save state to localStorage
+  document.body.classList.toggle("sidebar-pinned", sidebarPinned);
   localStorage.setItem("sidebarPinned", sidebarPinned);
 });
+
 
 // Set current year in footer
 const yearSpan = document.getElementById("copyrightYear");

@@ -647,13 +647,16 @@ body.is-resizing {
   animation: none;
 }
 
-/* Show sidebar on hover when not pinned */
-/* Sidebar Open State (toggled via JS) */
+body.sidebar-pinned .sidebar-trigger {
+  display: none;
+}
+
 .sidebar.open {
   transform: translateX(0);
   z-index: 151; /* High z-index when opened temporarily */
   box-shadow: 20px 0 50px rgba(0, 0, 0, 0.3); /* Deeper shadow when floating */
 }
+
 
 /* Light mode overrides for sidebar integration */
 [data-theme="light"] .sidebar {
@@ -669,19 +672,10 @@ body.is-resizing {
 
 /* Main Content */
 .main-content {
-  margin-left: 0; /* Full width */
+  margin-left: 0;
   margin-top: 0;
   padding: 20px;
-  transition: margin-left var(--transition-smooth);
   flex: 1;
-  /* width: 100%; */
-}
-
-/* Collapse content when sidebar is fully shown (pinned) 
-   We DO NOT shift content when just temporarily 'open' to avoid layout jumping 
-   unless the user explicitly pins it. 'open' will act as an overlay. */
-.sidebar.pinned ~ .main-content {
-  margin-left: var(--sidebar-width);
 }
 
 /* Gallery Grid */
