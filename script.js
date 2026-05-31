@@ -122,6 +122,15 @@ function getCachedManhwaURL(file) {
   return null;
 }
 
+// Check if a blob URL is still actively used by a visible <img> in the DOM
+function isBlobURLInUseByDOM(url) {
+  const images = gallery.querySelectorAll('img');
+  for (const img of images) {
+    if (img.src === url) return true;
+  }
+  return false;
+}
+
 function cacheManhwaURL(file, url) {
   // Evict oldest if over limit
   if (manhwaImageCache.size >= MAX_MANHWA_CACHE_SIZE) {
@@ -136,9 +145,15 @@ function cacheManhwaURL(file, url) {
     if (oldestKey) {
       const oldEntry = manhwaImageCache.get(oldestKey);
       if (oldEntry) {
-        __imgDebug.recordRevoke(oldEntry.url);
-        URL.revokeObjectURL(oldEntry.url);
-        objectURLs.delete(oldEntry.url);
+        // Only revoke if no DOM <img> still references this blob URL
+        if (!isBlobURLInUseByDOM(oldEntry.url)) {
+          __imgDebug.recordRevoke(oldEntry.url);
+          URL.revokeObjectURL(oldEntry.url);
+          objectURLs.delete(oldEntry.url);
+        } else {
+          __imgDebug.log('Skipped revoke — blob URL still in use by DOM', oldEntry.url);
+          // Still tracked in objectURLs for cleanup on clear/reset
+        }
       }
       manhwaImageCache.delete(oldestKey);
     }
@@ -1285,6 +1300,8 @@ function createInnerElement(file) {
 
     // Native load handler (replaces lazyloaded event from lazysizes)
     img.addEventListener("load", () => {
+      // Ignore the initial 1x1 placeholder load
+      if (img.src.startsWith('data:')) return;
       img.classList.remove("skeleton-loading");
       // Remove temporary wrapper height once loaded
       if (img.parentElement) {
@@ -1292,6 +1309,31 @@ function createInnerElement(file) {
       }
       // Mark as loaded for potential CSS hooks
       img.classList.add("lazyloaded");
+    });
+
+    // Error recovery: if blob URL was revoked or failed, recreate from file
+    img.addEventListener("error", () => {
+      // Only retry for blob URLs (not the initial placeholder)
+      if (!img.src || !img.src.startsWith('blob:')) return;
+      const wrapper = img.parentElement;
+      const sourceFile = wrapper && wrapper._file;
+      if (!sourceFile) return;
+
+      __imgDebug.log('Image error — retrying', sourceFile.name);
+
+      // Remove broken URL from cache and tracking
+      const brokenURL = img.src;
+      if (manhwaImageCache.has(sourceFile.name)) {
+        manhwaImageCache.delete(sourceFile.name);
+      }
+      objectURLs.delete(brokenURL);
+
+      // Create a fresh blob URL from the original file
+      const freshURL = URL.createObjectURL(sourceFile);
+      objectURLs.add(freshURL);
+      __imgDebug.recordCreate(freshURL, true);
+      cacheManhwaURL(sourceFile, freshURL);
+      img.src = freshURL;
     });
 
     const targetWidth = `${window.innerWidth * (maxWidthVW / 100)}px`;
