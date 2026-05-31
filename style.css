@@ -1017,6 +1017,10 @@ body.is-scrolling .manhwa-item img {
 
 .image-wrapper {
   position: relative;
+  width: 100%;
+  height: 100%;
+  max-width: 100%;
+  max-height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1027,8 +1031,10 @@ body.is-scrolling .manhwa-item img {
   max-width: 90vw;
   max-height: 90vh;
   object-fit: contain;
-  transition: transform 0.1s linear; /* Faster for zoom */
-  cursor: grab;
+  transition: transform 0.1s linear;
+  cursor: zoom-in;
+  will-change: transform;
+  touch-action: none; /* prevent browser touch gestures from interfering */
 }
 
 .modal-image:active {
@@ -1100,6 +1106,28 @@ body.is-scrolling .manhwa-item img {
 
 .zoom-btn:active {
   transform: scale(0.95);
+}
+
+.zoom-indicator {
+  position: absolute;
+  bottom: 78px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 4px 12px;
+  border-radius: 999px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 1003;
+  white-space: nowrap;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+.zoom-indicator.visible {
+  opacity: 1;
 }
 
 .close-modal-btn {

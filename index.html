@@ -40,9 +40,9 @@
 
           <div class="control-group">
             <select
-              id="modalMaxWidthSelect"
-              class="select-input"
-              title="Modal Width"
+               id="modalMaxWidthSelect"
+               class="select-input"
+               title="Manhwa Width"
             >
               <option value="30" selected>30% Width</option>
               <option value="40">40% Width</option>
@@ -273,10 +273,10 @@
                 </svg>
               </button>
               <button
-                id="resetZoomBtn"
-                class="zoom-btn"
-                aria-label="Reset Zoom"
-                title="Reset (R)"
+                 id="resetZoomBtn"
+                 class="zoom-btn"
+                 aria-label="Reset Zoom"
+                 title="Reset to fit (R)"
               >
                 <svg
                   width="20"
@@ -290,7 +290,10 @@
                   <path d="M3 3v5h5" />
                 </svg>
               </button>
-            </div>
+              </div>
+
+             <!-- Live zoom percentage indicator -->
+             <div id="zoomIndicator" class="zoom-indicator" aria-hidden="true">100%</div>
 
             <button
               id="closeModalBtn"

@@ -210,7 +210,6 @@ if (themeToggleBtn) {
   });
 }
 
-let modalMaxWidthVW = 30; // default
 let maxWidthVW = 30; // default for manhwa
 
 const BATCH_SIZE = 20;
@@ -396,6 +395,14 @@ let originY = 50;
 let isDragging = false;
 let dragStartX = 0;
 let dragStartY = 0;
+
+// === New continuous zoom system (Manga modal) ===
+const ZOOM_MIN = 0.1;
+const ZOOM_MAX = 20;
+const ZOOM_WHEEL_FACTOR = 0.0015; // wheel deltaY * this → log scale step (smooth)
+const ZOOM_BUTTON_FACTOR = 1.15; // per button click
+const ZOOM_KEYBOARD_STEP = 1.2;
+const ZOOM_DBLCLICK_FACTOR = 1.9; // step zoom factor for first dblclick
 
 // allowed extensions
 const extRegex = /\.(jpg|jpeg|png|webp|gif|bmp|svg)$/i;
@@ -1087,10 +1094,6 @@ mangaTab.addEventListener("click", () => {
   mangaTab.setAttribute("aria-pressed", "true");
   manhwaTab.setAttribute("aria-pressed", "false");
 
-  // Tự động set modalMaxWidthSelect về 70 khi chuyển sang manga
-  maxWidthSelect.value = "70";
-  modalMaxWidthVW = 70;
-  maxWidthVW = 70;
   // reset gallery and load from start
   resetAndLoad();
 });
@@ -1102,9 +1105,7 @@ manhwaTab.addEventListener("click", () => {
   manhwaTab.setAttribute("aria-pressed", "true");
   mangaTab.setAttribute("aria-pressed", "false");
 
-  // Tự động set modalMaxWidthSelect về 30 khi chuyển sang manhwa
   maxWidthSelect.value = "30";
-  modalMaxWidthVW = 30;
   maxWidthVW = 30;
 
   // Cập nhật lại width cho ảnh manhwa nếu đã có
@@ -1557,31 +1558,8 @@ function loadModalImage(file) {
   modalImage.src = currentFullResUrl;
 
   modalImage.onload = () => {
-    fitImageToViewWidth();
+    fitImageToView();
   };
-}
-
-function fitImageToViewWidth() {
-  const vw = window.innerWidth * (modalMaxWidthVW / 100);
-  const imgW = modalImage.naturalWidth || modalImage.width;
-  const imgH = modalImage.naturalHeight || modalImage.height;
-  const aspect = imgH / imgW;
-
-  let displayW = vw;
-  let displayH = vw * aspect;
-
-  // nếu vượt chiều cao viewport, giảm theo chiều cao
-  const maxH = window.innerHeight * 0.9;
-  if (displayH > maxH) {
-    displayH = maxH;
-    displayW = maxH / aspect;
-  }
-
-  modalImage.style.width = `${displayW}px`;
-  modalImage.style.height = `${displayH}px`;
-  modalImage.style.objectFit = "contain";
-
-  resetZoomState();
 }
 
 function updateManhwaImagesWidth() {
@@ -1594,15 +1572,8 @@ function updateManhwaImagesWidth() {
 }
 
 maxWidthSelect.addEventListener("change", (e) => {
-  modalMaxWidthVW = parseInt(e.target.value) || 30;
-  maxWidthVW = modalMaxWidthVW; // Đảm bảo đồng bộ cho manhwa
+  maxWidthVW = parseInt(e.target.value) || 30;
 
-  // Refit modal nếu đang mở (Manga)
-  if (mode === "manga" && modal.classList.contains("active") && !zoomed) {
-    fitImageToViewWidth();
-  }
-
-  // Cập nhật lại Manhwa images
   if (mode === "manhwa") {
     updateManhwaImagesWidth();
   }
@@ -1615,9 +1586,113 @@ function resetZoomState() {
   translateY = 0;
   originX = 50;
   originY = 50;
+  modalImage.style.transition = "transform 0.1s linear";
   modalImage.style.transformOrigin = "50% 50%";
   modalImage.style.transform = "translate(0px, 0px) scale(1)";
   modalImage.style.cursor = "zoom-in";
+  hideZoomIndicator();
+}
+
+function fitImageToView() {
+  if (!modalImage) return;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const imgW = modalImage.naturalWidth || 1;
+  const imgH = modalImage.naturalHeight || 1;
+  const aspect = imgH / imgW;
+
+  let displayW = vw * 0.85;
+  let displayH = displayW * aspect;
+  const maxH = vh * 0.85;
+  if (displayH > maxH) {
+    displayH = maxH;
+    displayW = displayH / aspect;
+  }
+
+  modalImage.style.width = `${displayW}px`;
+  modalImage.style.height = `${displayH}px`;
+  modalImage.style.objectFit = "contain";
+  resetZoomState();
+}
+
+function clampPan() {
+  if (!modalImage) return;
+  const rect = modalImage.getBoundingClientRect();
+  const container = modalImage.parentElement;
+  if (!container) return;
+  const cRect = container.getBoundingClientRect();
+  const imgW = rect.width;
+  const imgH = rect.height;
+  const contW = cRect.width;
+  const contH = cRect.height;
+  const maxX = Math.max(0, (imgW - contW) / 2);
+  const maxY = Math.max(0, (imgH - contH) / 2);
+  translateX = Math.max(-maxX, Math.min(maxX, translateX));
+  translateY = Math.max(-maxY, Math.min(maxY, translateY));
+  modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
+}
+
+function zoomTo(target, clientX = null, clientY = null, animate = false) {
+  const rect = modalImage.getBoundingClientRect();
+  const imgW = rect.width;
+  const imgH = rect.height;
+
+  // Current visual center in image space (accounting for current transform)
+  const prevScale = scale;
+
+  let newScale;
+  if (target > 0) {
+    newScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, target));
+  } else {
+    // relative zoom (target is negative multiplier like -1.15)
+    newScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, prevScale * Math.abs(target)));
+  }
+
+  if (newScale === prevScale) return;
+
+  // Determine pivot point in client coordinates
+  let pivotClientX = clientX;
+  let pivotClientY = clientY;
+  if (pivotClientX == null || pivotClientY == null) {
+    // default to center of image
+    pivotClientX = rect.left + imgW / 2;
+    pivotClientY = rect.top + imgH / 2;
+  }
+
+  // Convert pivot to image-relative percentages (before new scale)
+  const offsetX = pivotClientX - rect.left;
+  const offsetY = pivotClientY - rect.top;
+
+  // How much the point moves due to scale change
+  const scaleRatio = newScale / prevScale;
+
+  // New translate so that the point under the cursor stays under the cursor
+  translateX = (translateX + offsetX) * scaleRatio - offsetX;
+  translateY = (translateY + offsetY) * scaleRatio - offsetY;
+
+  scale = newScale;
+  zoomed = scale > 1.001;
+
+  // Update origin for visual correctness (we still use translate+scale, origin stays center)
+  modalImage.style.transformOrigin = "50% 50%";
+
+  if (animate) {
+    modalImage.style.transition = "transform 0.15s cubic-bezier(0.25, 0.1, 0.25, 1)";
+  } else {
+    modalImage.style.transition = "none";
+  }
+
+  modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
+  modalImage.style.cursor = zoomed ? "grab" : "zoom-in";
+
+  showZoomIndicator(Math.round(scale * 100));
+  clampPan();
+
+  if (animate) {
+    setTimeout(() => {
+      if (modalImage) modalImage.style.transition = "none";
+    }, 160);
+  }
 }
 
 // click outside to close
@@ -1637,75 +1712,44 @@ function closeModal() {
   // Let's keep it until next navigation or clear.
 }
 
-// click image to toggle zoom into clicked point
-modalImage.addEventListener("click", (e) => {
-  if (!zoomed) {
-    // calculate click position relative to image element
-    const rect = modalImage.getBoundingClientRect();
-    const offsetX = e.clientX - rect.left;
-    const offsetY = e.clientY - rect.top;
-    const percentX = (offsetX / rect.width) * 100;
-    const percentY = (offsetY / rect.height) * 100;
-
-    zoomed = true;
-    scale = 2; // zoom multiplier (tweakable)
-    originX = percentX;
-    originY = percentY;
-    modalImage.style.transformOrigin = `${originX}% ${originY}%`;
-    modalImage.style.transform = `translate(0px, 0px) scale(${scale})`;
-    modalImage.style.cursor = "grab";
-    translateX = 0;
-    translateY = 0;
-  } // else {
-  //   // return to fit 90vw
-  //   fitImageToViewWidth();
-  // }
+// Double-click: toggle between fit (reset) and 100% natural size at click point
+modalImage.addEventListener("dblclick", (e) => {
+  e.preventDefault();
+  if (scale > 1.05) {
+    fitImageToView();
+  } else {
+    zoomTo(scale * ZOOM_DBLCLICK_FACTOR, e.clientX, e.clientY, true);
+  }
 });
 
-// wheel to move when zoomed: vertical by default; Shift + wheel -> horizontal
+// Wheel = zoom (cursor-centered). Always active. Shift not needed anymore.
 modalImage.addEventListener(
   "wheel",
   (e) => {
-    if (!zoomed) return;
     e.preventDefault();
-    const speed = 40; // pixels per wheel delta step - tune as needed
-    // deltaY > 0 means scroll down -> move image up -> translateY decreases
-    if (e.shiftKey) {
-      translateX -= e.deltaY > 0 ? speed : -speed;
-    } else {
-      translateY -= e.deltaY > 0 ? speed : -speed;
-    }
-    modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
+
+    // Use exponential zoom for natural feel (like Photoshop / Viewer.js)
+    const delta = -e.deltaY; // positive = zoom in
+    const factor = Math.exp(delta * ZOOM_WHEEL_FACTOR);
+    zoomTo(scale * factor, e.clientX, e.clientY, false);
   },
   { passive: false },
 );
 
-// zoom buttons
+// zoom buttons — now use central helper with smooth animation
 zoomInBtn.addEventListener("click", () => {
-  if (!zoomed) {
-    zoomed = true;
-    scale = 1;
-  } // start zoom from current fit
-  scale *= 1.2;
-  modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
-  modalImage.style.cursor = "grab";
+  zoomTo(scale * ZOOM_BUTTON_FACTOR, null, null, true);
 });
 zoomOutBtn.addEventListener("click", () => {
-  scale = Math.max(1, scale / 1.2);
-  if (scale === 1) {
-    // back to fit
-    fitImageToViewWidth();
-  } else {
-    modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
-  }
+  zoomTo(scale / ZOOM_BUTTON_FACTOR, null, null, true);
 });
 resetZoomBtn.addEventListener("click", () => {
-  fitImageToViewWidth();
+  fitImageToView();
 });
 
-// bắt đầu drag
+// Drag to pan (works whenever we are zoomed beyond fit)
 modalImage.addEventListener("mousedown", (e) => {
-  if (!zoomed) return;
+  if (scale <= 1.01) return; // only pan when actually zoomed
   e.preventDefault();
   isDragging = true;
   dragStartX = e.clientX - translateX;
@@ -1716,23 +1760,78 @@ modalImage.addEventListener("mousedown", (e) => {
   window.addEventListener("mouseup", onMouseUp);
 });
 
-// kéo
 function onMouseMove(e) {
-  if (!zoomed || !isDragging) return;
+  if (!isDragging) return;
   translateX = e.clientX - dragStartX;
   translateY = e.clientY - dragStartY;
   modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
+  clampPan();
 }
 
-// kết thúc drag
 function onMouseUp() {
-  if (!zoomed) return;
   isDragging = false;
-  modalImage.style.cursor = "grab";
-  
+  modalImage.style.cursor = scale > 1.01 ? "grab" : "zoom-in";
   window.removeEventListener("mousemove", onMouseMove);
   window.removeEventListener("mouseup", onMouseUp);
 }
+
+/* ========== Pinch-to-zoom (touch + pointer unified) ========== */
+let pointers = new Map();
+
+function getPinchDistance() {
+  const pts = Array.from(pointers.values());
+  if (pts.length < 2) return 0;
+  const dx = pts[0].x - pts[1].x;
+  const dy = pts[0].y - pts[1].y;
+  return Math.hypot(dx, dy);
+}
+
+function getPinchCenter() {
+  const pts = Array.from(pointers.values());
+  if (pts.length < 2) return null;
+  return {
+    x: (pts[0].x + pts[1].x) / 2,
+    y: (pts[0].y + pts[1].y) / 2,
+  };
+}
+
+modalImage.addEventListener("pointerdown", (e) => {
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pointers.size === 2) {
+    // entering pinch
+    modalImage.setPointerCapture(e.pointerId);
+  }
+});
+
+modalImage.addEventListener("pointermove", (e) => {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+  if (pointers.size === 2) {
+    const dist = getPinchDistance();
+    if (!modalImage._lastPinchDist) {
+      modalImage._lastPinchDist = dist;
+      return;
+    }
+    const center = getPinchCenter();
+    const ratio = dist / modalImage._lastPinchDist;
+    modalImage._lastPinchDist = dist;
+
+    // Apply relative zoom toward pinch center
+    zoomTo(scale * ratio, center.x, center.y, false);
+  }
+});
+
+function endPointer(e) {
+  pointers.delete(e.pointerId);
+  modalImage._lastPinchDist = 0;
+  if (pointers.size < 2) {
+    // back to single pointer or none — let normal drag take over if needed
+  }
+}
+modalImage.addEventListener("pointerup", endPointer);
+modalImage.addEventListener("pointercancel", endPointer);
+modalImage.addEventListener("pointerleave", endPointer);
 
 // prev/next buttons
 prevBtn.addEventListener("click", () => navigateModal(-1));
@@ -1751,15 +1850,70 @@ function arrowContinuousScroll() {
   }
 }
 
+/* Zoom indicator helpers */
+let zoomIndicatorTimeout = null;
+const zoomIndicator = document.getElementById("zoomIndicator");
+
+function showZoomIndicator(percent) {
+  if (!zoomIndicator) return;
+  zoomIndicator.textContent = `${percent}%`;
+  zoomIndicator.classList.add("visible");
+  zoomIndicator.setAttribute("aria-hidden", "false");
+
+  clearTimeout(zoomIndicatorTimeout);
+  zoomIndicatorTimeout = setTimeout(() => {
+    hideZoomIndicator();
+  }, 8000);
+}
+
+if (zoomIndicator) {
+  zoomIndicator.style.pointerEvents = "auto";
+  zoomIndicator.style.cursor = "pointer";
+  zoomIndicator.addEventListener("click", () => {
+    fitImageToView();
+  });
+}
+
+function hideZoomIndicator() {
+  if (!zoomIndicator) return;
+  zoomIndicator.classList.remove("visible");
+  zoomIndicator.setAttribute("aria-hidden", "true");
+}
+
 window.addEventListener("keydown", (e) => {
   // Skip if focused on input elements
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.target.tagName === "TEXTAREA") return;
 
   if (modal.classList.contains("active")) {
-    // Modal navigation
+    // Modal navigation + zoom
     if (e.key === "ArrowRight") navigateModal(1);
     else if (e.key === "ArrowLeft") navigateModal(-1);
     else if (e.key === "Escape") closeModal();
+    else if (e.key === "+" || e.key === "=") {
+      e.preventDefault();
+      zoomTo(scale * ZOOM_KEYBOARD_STEP, null, null, true);
+    } else if (e.key === "-") {
+      e.preventDefault();
+      zoomTo(scale / ZOOM_KEYBOARD_STEP, null, null, true);
+    } else if (e.key === "0") {
+      e.preventDefault();
+      fitImageToView();
+    } else if (e.key === "1") {
+      e.preventDefault();
+      const rect = modalImage.getBoundingClientRect();
+      const target = (modalImage.naturalWidth || rect.width) / rect.width;
+      zoomTo(Math.min(ZOOM_MAX, target), null, null, true);
+    } else if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key) && scale > 1.05) {
+      // Pan with arrows when zoomed
+      e.preventDefault();
+      const panStep = 80;
+      if (e.key === "ArrowUp") translateY += panStep;
+      if (e.key === "ArrowDown") translateY -= panStep;
+      if (e.key === "ArrowLeft") translateX += panStep;
+      if (e.key === "ArrowRight") translateX -= panStep;
+      modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
+      clampPan();
+    }
   } else {
     // Folder navigation (when modal is not open)
     if (e.key === "ArrowLeft") {
@@ -1861,7 +2015,7 @@ window.addEventListener("resize", () => {
   if (modal.classList.contains("active") && !zoomed) {
     clearTimeout(resizeTimeout);
     resizeTimeout = setTimeout(() => {
-      fitImageToViewWidth();
+      fitImageToView();
     }, 100);
   }
 });
