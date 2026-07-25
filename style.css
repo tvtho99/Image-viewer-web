@@ -274,6 +274,48 @@ body.is-scrolling .glass-panel {
   color: var(--text-main);
 }
 
+.mode-size-control[hidden] {
+  display: none;
+}
+
+.size-stepper {
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-input);
+}
+
+.size-stepper-btn {
+  border: 0;
+  background: transparent;
+  color: var(--text-main);
+  padding: 8px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.size-stepper-btn:hover:not(:disabled) {
+  background: var(--bg-input-hover);
+}
+
+.size-stepper-btn:focus-visible {
+  outline: 2px solid var(--primary-color);
+  outline-offset: -2px;
+}
+
+.size-stepper-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+#manhwaWidthValue {
+  min-width: 48px;
+  text-align: center;
+  color: var(--text-main);
+}
+
 .action-btn {
   display: flex;
   align-items: center;
