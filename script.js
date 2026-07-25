@@ -183,10 +183,14 @@ const mangaTab = document.getElementById("mangaTab");
 const manhwaTab = document.getElementById("manhwaTab");
 
 const thumbSizeSelect = document.getElementById("thumbSize");
+const manhwaWidthControl = document.getElementById("manhwaWidthControl");
+const mangaSizeControl = document.getElementById("mangaSizeControl");
+const decreaseManhwaWidth = document.getElementById("decreaseManhwaWidth");
+const increaseManhwaWidth = document.getElementById("increaseManhwaWidth");
+const manhwaWidthValue = document.getElementById("manhwaWidthValue");
 
 const gallery = document.getElementById("gallery");
 
-const maxWidthSelect = document.getElementById("modalMaxWidthSelect");
 const mainBody = document.getElementById("mainBody");
 
 // Theme Toggle Logic
@@ -1195,6 +1199,7 @@ mangaTab.addEventListener("click", () => {
   manhwaTab.classList.remove("active");
   mangaTab.setAttribute("aria-pressed", "true");
   manhwaTab.setAttribute("aria-pressed", "false");
+  setSizeControlMode(mode, manhwaWidthControl, mangaSizeControl);
 
   // reset gallery and load from start
   resetAndLoad();
@@ -1207,14 +1212,15 @@ manhwaTab.addEventListener("click", () => {
   manhwaTab.setAttribute("aria-pressed", "true");
   mangaTab.setAttribute("aria-pressed", "false");
 
-  maxWidthSelect.value = "30";
-  maxWidthVW = 30;
+  setSizeControlMode(mode, manhwaWidthControl, mangaSizeControl);
 
   // Cập nhật lại width cho ảnh manhwa nếu đã có
   updateManhwaImagesWidth();
   // reset gallery and load from start
   resetAndLoad();
 });
+
+setSizeControlMode(mode, manhwaWidthControl, mangaSizeControl);
 
 /* ---------- Thumb size control ---------- */
 thumbSizeSelect.addEventListener("change", (e) => {
@@ -1703,13 +1709,21 @@ function updateManhwaImagesWidth() {
   });
 }
 
-maxWidthSelect.addEventListener("change", (e) => {
-  maxWidthVW = parseInt(e.target.value) || 30;
+function syncManhwaWidthControl() {
+  manhwaWidthValue.textContent = `${maxWidthVW}%`;
+  decreaseManhwaWidth.disabled = maxWidthVW === 10;
+  increaseManhwaWidth.disabled = maxWidthVW === 100;
+}
 
-  if (mode === "manhwa") {
-    updateManhwaImagesWidth();
-  }
-});
+function changeManhwaWidth(direction) {
+  maxWidthVW = stepManhwaWidth(maxWidthVW, direction);
+  syncManhwaWidthControl();
+  if (mode === "manhwa") updateManhwaImagesWidth();
+}
+
+decreaseManhwaWidth.addEventListener("click", () => changeManhwaWidth(-1));
+increaseManhwaWidth.addEventListener("click", () => changeManhwaWidth(1));
+syncManhwaWidthControl();
 
 function resetZoomState() {
   zoomed = false;

@@ -39,26 +39,37 @@
           <div class="control-separator"></div>
 
           <div class="control-group">
-            <select
-               id="modalMaxWidthSelect"
-               class="select-input"
-               title="Manhwa Width"
+            <div
+              id="manhwaWidthControl"
+              class="mode-size-control size-stepper"
+              aria-label="Manhwa image width"
             >
-              <option value="30" selected>30% Width</option>
-              <option value="40">40% Width</option>
-              <option value="50">50% Width</option>
-              <option value="60">60% Width</option>
-              <option value="70">70% Width</option>
-              <option value="80">80% Width</option>
-              <option value="90">90% Width</option>
-              <option value="100">100% Width</option>
-            </select>
+              <button
+                id="decreaseManhwaWidth"
+                class="size-stepper-btn"
+                type="button"
+                aria-label="Decrease Manhwa image width"
+              >
+                −
+              </button>
+              <output id="manhwaWidthValue" aria-live="polite">30%</output>
+              <button
+                id="increaseManhwaWidth"
+                class="size-stepper-btn"
+                type="button"
+                aria-label="Increase Manhwa image width"
+              >
+                +
+              </button>
+            </div>
 
-            <select id="thumbSize" class="select-input" title="Thumbnail Size">
-              <option value="small">Small</option>
-              <option value="medium" selected>Medium</option>
-              <option value="large">Large</option>
-            </select>
+            <div id="mangaSizeControl" class="mode-size-control" hidden>
+              <select id="thumbSize" class="select-input" title="Thumbnail Size">
+                <option value="small">Small</option>
+                <option value="medium" selected>Medium</option>
+                <option value="large">Large</option>
+              </select>
+            </div>
           </div>
 
           <div class="control-group">
@@ -370,6 +381,7 @@
     </div>
 
     <script src="explorer-tree.js"></script>
+    <script src="image-size-controls.js"></script>
     <script src="lazysizes.min.js" async=""></script>
     <script src="script.js"></script>
   </body>
