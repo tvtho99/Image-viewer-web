@@ -251,6 +251,7 @@ let fileObjects = []; // Array of File objects directly
 let currentIndex = 0; // index for batch loading
 let isBatchLoading = false; // Prevent concurrent loading
 let currentRAF = null; // Track current RAF to cancel on reset
+let isInitialLoadInProgress = false;
 
 // Unload Observer for Virtual Scrolling / DOM Cleanup
 let unloadObserver = null;
@@ -464,6 +465,8 @@ const sidebar = document.getElementById("sidebar");
 let subfolders = []; // [{name, handle}]
 let currentFolderHandle = null;
 let currentSubfolder = null;
+let currentImageFolderHandle = null;
+let rootFileObjects = [];
 let explorerSortMode = localStorage.getItem("explorerSortMode") === "natural" ? "natural" : "string";
 
 // Sidebar Trigger Logic
@@ -646,76 +649,79 @@ if (ctxSetRoot) {
 }
 
 // Hàm duyệt folder, lấy file ảnh ở root và danh sách folder con
-async function handleDirectoryHandle(dirHandle) {
-  // Cleanup old URLs
-  if (currentFullResUrl) {
-    __imgDebug.recordRevoke(currentFullResUrl);
-    URL.revokeObjectURL(currentFullResUrl);
-    currentFullResUrl = null;
+async function folderHandlesMatch(first, second) {
+  if (!first || !second) return false;
+  if (first === second) return true;
+
+  if (typeof first.isSameEntry === "function") {
+    try {
+      return await first.isSameEntry(second);
+    } catch (err) {
+      console.warn("Cannot compare folder handles", err);
+    }
   }
 
-  fileObjects = [];
-  subfolders = [];
-  currentFolderHandle = dirHandle;
-  currentSubfolder = null;
+  return Boolean(
+    first.dirEntry &&
+      second.dirEntry &&
+      first.dirEntry.fullPath === second.dirEntry.fullPath,
+  );
+}
+
+async function readFolderContents(dirHandle) {
+  const files = [];
+  const folders = [];
 
   for await (const [name, handle] of dirHandle.entries()) {
     if (handle.kind === "file" && isImageName(name)) {
       try {
-        const file = await handle.getFile();
-        // Store FILE object directly, NOT URL
-        fileObjects.push(file);
+        files.push(await handle.getFile());
       } catch (err) {
         console.warn("Cannot read file", name, err);
       }
     } else if (handle.kind === "directory") {
-      subfolders.push({ name, handle });
+      folders.push({ name, handle });
     }
   }
-  // Sort by name (files stay string sort; folders use explorer mode)
-  fileObjects.sort((a, b) => a.name.localeCompare(b.name));
-  subfolders.sort((a, b) => compareFolderNames(a, b));
 
-  await renderSidebarTree();
-  resetAndLoad();
-  sidebar.classList.add("open");
+  files.sort((a, b) => a.name.localeCompare(b.name));
+  folders.sort((a, b) => compareFolderNames(a, b));
+  return { files, folders };
 }
 
-// Khi chọn folder con, duyệt sâu vào folder đó
-async function handleSubfolderHandle(dirHandle) {
+async function handleDirectoryHandle(dirHandle) {
   if (currentFullResUrl) {
     __imgDebug.recordRevoke(currentFullResUrl);
     URL.revokeObjectURL(currentFullResUrl);
     currentFullResUrl = null;
   }
 
-  fileObjects = [];
-  // KHÔNG cập nhật lại sidebar tree, chỉ cập nhật ảnh
-  for await (const [name, handle] of dirHandle.entries()) {
-    if (handle.kind === "file" && isImageName(name)) {
-      try {
-        const file = await handle.getFile();
-        fileObjects.push(file);
-      } catch (err) {
-        console.warn("Cannot read file", name, err);
-      }
-    }
-  }
-  fileObjects.sort((a, b) => a.name.localeCompare(b.name));
-  // KHÔNG gọi await renderSidebarTree();
+  const contents = await readFolderContents(dirHandle);
+  fileObjects = contents.files;
+  rootFileObjects = contents.files;
+  subfolders = contents.folders;
+  currentFolderHandle = dirHandle;
+  currentImageFolderHandle = dirHandle;
+  currentSubfolder = null;
+
+  await renderSidebarTree();
   resetAndLoad();
+  sidebar.classList.add("open");
+  return contents;
 }
 
-// Helper: Get immediate subfolders only (Non-recursive)
-async function getSubfolders(dirHandle) {
-  const folders = [];
-  for await (const [name, handle] of dirHandle.entries()) {
-    if (handle.kind === "directory") {
-      folders.push({ name, handle, children: [] }); // children empty initially
-    }
+async function handleSubfolderHandle(dirHandle, contents = null) {
+  if (currentFullResUrl) {
+    __imgDebug.recordRevoke(currentFullResUrl);
+    URL.revokeObjectURL(currentFullResUrl);
+    currentFullResUrl = null;
   }
-  folders.sort((a, b) => compareFolderNames(a, b));
-  return folders;
+
+  const folderContents = contents || (await readFolderContents(dirHandle));
+  fileObjects = folderContents.files;
+  currentImageFolderHandle = dirHandle;
+  resetAndLoad();
+  return folderContents;
 }
 
 function showContextMenu(e, node) {
@@ -738,6 +744,48 @@ function showContextMenu(e, node) {
 }
 
 // Render tree folder trên sidebar
+function setFolderExpanded(toggle, childContainer, expanded) {
+  childContainer.style.display = expanded ? "block" : "none";
+  toggle.setAttribute("aria-expanded", String(expanded));
+  toggle.title = expanded ? "Collapse folder" : "Expand folder";
+}
+
+function createFolderToggle(name) {
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "folder-toggle";
+  toggle.setAttribute("aria-label", `Expand ${name}`);
+  toggle.setAttribute("aria-expanded", "false");
+  return toggle;
+}
+
+function setActiveFolderButton(button) {
+  sidebar.querySelectorAll(".folder-btn").forEach((item) => {
+    item.classList.remove("active");
+  });
+  button.classList.add("active");
+}
+
+async function scrollToExplorerImage(fileName) {
+  const imageIndex = fileObjects.findIndex((file) => file.name === fileName);
+  if (imageIndex < 0) return;
+
+  let item = null;
+  while (!item) {
+    item = Array.from(gallery.children).find(
+      (candidate) => candidate._file && candidate._file.name === fileName,
+    );
+    if (item) break;
+
+    if (!isInitialLoadInProgress && !isBatchLoading && currentIndex < fileObjects.length) {
+      loadMoreImages();
+    }
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  }
+
+  item.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
+}
+
 async function renderSidebarTree() {
   const sidebarContent = sidebar.querySelector(".sidebar-content");
   sidebarContent.innerHTML = "";
@@ -746,11 +794,10 @@ async function renderSidebarTree() {
     return;
   }
 
-  // Create Root Wrapper
   const rootWrapper = document.createElement("div");
   rootWrapper.className = "folder-node";
 
-  // Nút cho folder gốc
+  const rootToggle = createFolderToggle(currentFolderHandle.name || "Root Folder");
   const rootBtn = document.createElement("button");
   const rootSpan = document.createElement("span");
   rootSpan.textContent = currentFolderHandle.name || "Root Folder";
@@ -760,39 +807,52 @@ async function renderSidebarTree() {
   rootBtn.className =
     "folder-btn" + (currentSubfolder === null ? " active" : "");
 
+  const rootChildren = document.createElement("div");
+  rootChildren.className = "folder-tree-children";
+  setFolderExpanded(rootToggle, rootChildren, true);
+
+  rootToggle.onclick = () => {
+    const expanded = rootToggle.getAttribute("aria-expanded") !== "true";
+    setFolderExpanded(rootToggle, rootChildren, expanded);
+  };
+
   rootBtn.onclick = async () => {
-    const allFolderButtons = sidebar.querySelectorAll(".folder-btn");
-    allFolderButtons.forEach((b) => b.classList.remove("active"));
-    currentSubfolder = null;
-    rootBtn.classList.add("active");
-    await new Promise((resolve) => requestAnimationFrame(resolve));
+    if (await folderHandlesMatch(currentImageFolderHandle, currentFolderHandle)) {
+      currentSubfolder = null;
+      setActiveFolderButton(rootBtn);
+      setFolderExpanded(rootToggle, rootChildren, true);
+      return;
+    }
+
     await handleDirectoryHandle(currentFolderHandle);
   };
 
   rootBtn.oncontextmenu = (e) =>
-    showContextMenu(e, { name: currentFolderHandle.name || "Root Folder", handle: currentFolderHandle });
+    showContextMenu(e, {
+      name: currentFolderHandle.name || "Root Folder",
+      handle: currentFolderHandle,
+    });
 
+  renderTreeNodes(subfolders, rootChildren);
+  renderImageNodes(rootFileObjects, rootChildren, async (file) => {
+    if (!(await folderHandlesMatch(currentImageFolderHandle, currentFolderHandle))) {
+      await handleDirectoryHandle(currentFolderHandle);
+    }
+    await scrollToExplorerImage(file.name);
+  });
+
+  rootWrapper.appendChild(rootToggle);
   rootWrapper.appendChild(rootBtn);
-
-  // Lấy immediate subfolders và render vào container thụt lề
-  const folders = await getSubfolders(currentFolderHandle);
-  if (folders.length > 0) {
-    const treeContainer = document.createElement("div");
-    treeContainer.className = "folder-tree-children";
-    treeContainer.style.display = "block"; // Always show root children
-    renderTreeNodes(folders, treeContainer);
-    rootWrapper.appendChild(treeContainer);
-  }
-
+  rootWrapper.appendChild(rootChildren);
   sidebarContent.appendChild(rootWrapper);
 }
 
-// Render node với lazy loading
 function renderTreeNodes(nodes, container) {
   nodes.forEach((node) => {
     const wrapper = document.createElement("div");
     wrapper.className = "folder-node";
 
+    const toggle = createFolderToggle(node.name);
     const btn = document.createElement("button");
     const span = document.createElement("span");
     span.textContent = node.name;
@@ -801,40 +861,65 @@ function renderTreeNodes(nodes, container) {
     btn._folderHandle = node.handle;
     btn.className = "folder-btn";
 
-    // Container cho children (ẩn mặc định)
     const childContainer = document.createElement("div");
     childContainer.className = "folder-tree-children";
-    childContainer.style.display = "none"; // Ẩn ban đầu
+    setFolderExpanded(toggle, childContainer, false);
 
     let loaded = false;
+    let contents = null;
+    let loadPromise = null;
+    let selectPromise = null;
 
-    btn.onclick = async (e) => {
-      e.stopPropagation();
-
-      // 1. Load images của folder này
-      currentSubfolder = node.name;
-      const allFolderButtons = sidebar.querySelectorAll(".folder-btn");
-      allFolderButtons.forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-      await handleSubfolderHandle(node.handle);
-
-      // 2. Lazy load subfolders nếu chưa load
-      if (!loaded) {
-        const children = await getSubfolders(node.handle);
-        if (children.length > 0) {
-          renderTreeNodes(children, childContainer);
-          childContainer.style.display = "block";
-        }
-        loaded = true;
-      } else {
-        // Toggle visibility nếu đã load
-        childContainer.style.display =
-          childContainer.style.display === "none" ? "block" : "none";
+    async function loadChildren() {
+      if (loaded) return contents;
+      if (!loadPromise) {
+        loadPromise = readFolderContents(node.handle)
+          .then((result) => {
+            contents = result;
+            renderTreeNodes(result.folders, childContainer);
+            renderImageNodes(result.files, childContainer, async (file) => {
+              await selectFolder();
+              await scrollToExplorerImage(file.name);
+            });
+            loaded = true;
+            return result;
+          })
+          .finally(() => {
+            if (!loaded) loadPromise = null;
+          });
       }
-    };
+      return loadPromise;
+    }
 
+    async function selectFolder() {
+      if (selectPromise) return selectPromise;
+
+      selectPromise = (async () => {
+        const folderContents = await loadChildren();
+        if (!(await folderHandlesMatch(currentImageFolderHandle, node.handle))) {
+          await handleSubfolderHandle(node.handle, folderContents);
+        }
+        currentSubfolder = node.name;
+        setActiveFolderButton(btn);
+        setFolderExpanded(toggle, childContainer, true);
+      })();
+
+      try {
+        await selectPromise;
+      } finally {
+        selectPromise = null;
+      }
+    }
+
+    toggle.onclick = async () => {
+      await loadChildren();
+      const expanded = toggle.getAttribute("aria-expanded") !== "true";
+      setFolderExpanded(toggle, childContainer, expanded);
+    };
+    btn.onclick = selectFolder;
     btn.oncontextmenu = (e) => showContextMenu(e, node);
 
+    wrapper.appendChild(toggle);
     wrapper.appendChild(btn);
     wrapper.appendChild(childContainer);
     container.appendChild(wrapper);
@@ -1149,6 +1234,7 @@ function resetAndLoad() {
     currentRAF = null;
   }
   isBatchLoading = false;
+  isInitialLoadInProgress = false;
 
   // Initialize virtual unload observer
   initUnloadObserver();
@@ -1407,19 +1493,25 @@ document.addEventListener("lazybeforeunveil", function (e) {
 function loadInitialImages() {
   if (fileObjects.length === 0) return;
 
+  isInitialLoadInProgress = true;
   const CHUNK_SIZE = 5; // Small chunks for responsive UI
   const initialCount = Math.min(BATCH_SIZE, fileObjects.length);
   let chunkStart = 0;
+
+  function finishInitialLoad() {
+    currentIndex = initialCount;
+    currentRAF = null;
+    isInitialLoadInProgress = false;
+    if (currentIndex < fileObjects.length) {
+      startContinuousLoading();
+    }
+  }
 
   function loadChunk() {
     const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, initialCount);
 
     if (chunkStart >= initialCount) {
-      currentIndex = initialCount;
-      // Start continuous time-based loading for remaining images
-      if (currentIndex < fileObjects.length) {
-        startContinuousLoading();
-      }
+      finishInitialLoad();
       return;
     }
 
@@ -1434,19 +1526,13 @@ function loadInitialImages() {
     gallery.appendChild(fragment);
     chunkStart = chunkEnd;
 
-    // Schedule next chunk
     if (chunkStart < initialCount) {
       currentRAF = requestAnimationFrame(loadChunk);
     } else {
-      currentIndex = initialCount;
-      // Start continuous time-based loading for remaining images
-      if (currentIndex < fileObjects.length) {
-        startContinuousLoading();
-      }
+      finishInitialLoad();
     }
   }
 
-  // Start loading
   currentRAF = requestAnimationFrame(loadChunk);
 }
 
@@ -1559,6 +1645,8 @@ clearBtn.addEventListener("click", () => {
   // Reset folder state
   currentFolderHandle = null;
   currentSubfolder = null;
+  currentImageFolderHandle = null;
+  rootFileObjects = [];
 
   // Clear sidebar
   renderSidebarTree();

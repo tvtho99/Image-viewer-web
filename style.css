@@ -514,6 +514,46 @@ body.is-resizing {
   padding: 12px;
 }
 
+.folder-node {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+}
+
+.folder-toggle {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+}
+
+.folder-toggle::before {
+  content: "›";
+  display: block;
+  font-size: 20px;
+  line-height: 1;
+  transition: transform 0.2s ease;
+}
+
+.folder-toggle[aria-expanded="true"]::before {
+  transform: rotate(90deg);
+}
+
+.folder-toggle:hover {
+  background: var(--bg-input-hover);
+}
+
+.folder-toggle:focus-visible,
+.image-file:focus-visible {
+  outline: 2px solid var(--primary-color);
+  outline-offset: 2px;
+}
+
 .folder-tree {
   display: flex;
   flex-direction: column;
@@ -580,11 +620,41 @@ body.is-resizing {
 }
 
 .folder-tree-children {
+  grid-column: 1 / -1;
   margin-left: 16px;
   padding-left: 8px;
   border-left: 1px solid var(--border-color);
   margin-top: 4px;
   margin-bottom: 4px;
+}
+
+.image-file {
+  position: relative;
+  width: 100%;
+  padding: 8px 12px 8px 38px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.image-file:hover {
+  background: var(--bg-input-hover);
+  color: var(--text-main);
+}
+
+.image-file::before {
+  content: "\25A7";
+  position: absolute;
+  left: 14px;
+  color: var(--primary-color);
 }
 
 /* Sidebar Trigger */
