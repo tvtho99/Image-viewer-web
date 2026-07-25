@@ -744,12 +744,6 @@ function showContextMenu(e, node) {
 }
 
 // Render tree folder trên sidebar
-function setFolderExpanded(toggle, childContainer, expanded) {
-  childContainer.style.display = expanded ? "block" : "none";
-  toggle.setAttribute("aria-expanded", String(expanded));
-  toggle.title = expanded ? "Collapse folder" : "Expand folder";
-}
-
 function createFolderToggle(name) {
   const toggle = document.createElement("button");
   toggle.type = "button";
@@ -817,14 +811,21 @@ async function renderSidebarTree() {
   };
 
   rootBtn.onclick = async () => {
+    const expanded = rootToggle.getAttribute("aria-expanded") !== "true";
     if (await folderHandlesMatch(currentImageFolderHandle, currentFolderHandle)) {
       currentSubfolder = null;
       setActiveFolderButton(rootBtn);
-      setFolderExpanded(rootToggle, rootChildren, true);
+      setFolderExpanded(rootToggle, rootChildren, expanded);
       return;
     }
 
     await handleDirectoryHandle(currentFolderHandle);
+    const nextRoot = sidebar.querySelector(".sidebar-content > .folder-node");
+    setFolderExpanded(
+      nextRoot.querySelector(".folder-toggle"),
+      nextRoot.querySelector(".folder-tree-children"),
+      expanded,
+    );
   };
 
   rootBtn.oncontextmenu = (e) =>
@@ -879,6 +880,7 @@ function renderTreeNodes(nodes, container) {
             renderTreeNodes(result.folders, childContainer);
             renderImageNodes(result.files, childContainer, async (file) => {
               await selectFolder();
+              setFolderExpanded(toggle, childContainer, true);
               await scrollToExplorerImage(file.name);
             });
             loaded = true;
@@ -901,7 +903,6 @@ function renderTreeNodes(nodes, container) {
         }
         currentSubfolder = node.name;
         setActiveFolderButton(btn);
-        setFolderExpanded(toggle, childContainer, true);
       })();
 
       try {
@@ -916,7 +917,8 @@ function renderTreeNodes(nodes, container) {
       const expanded = toggle.getAttribute("aria-expanded") !== "true";
       setFolderExpanded(toggle, childContainer, expanded);
     };
-    btn.onclick = selectFolder;
+    btn.onclick = () =>
+      selectAndToggleFolder(toggle, childContainer, selectFolder);
     btn.oncontextmenu = (e) => showContextMenu(e, node);
 
     wrapper.appendChild(toggle);
