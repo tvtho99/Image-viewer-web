@@ -1,5 +1,15 @@
 "use strict";
 
+// Reading order for image files: "2.jpg" before "10.jpg".
+const fileNameCollator = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: "base",
+});
+
+function compareFileNames(a, b) {
+  return fileNameCollator.compare(a.name, b.name);
+}
+
 function setFolderExpanded(toggle, childContainer, expanded) {
   childContainer.style.display = expanded ? "block" : "none";
   toggle.setAttribute("aria-expanded", String(expanded));
@@ -27,6 +37,7 @@ function renderImageNodes(files, container, onSelect, documentRef = document) {
 }
 
 const explorerTree = {
+  compareFileNames,
   renderImageNodes,
   selectAndToggleFolder,
   setFolderExpanded,

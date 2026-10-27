@@ -1,182 +1,28 @@
 "use strict";
 /* script.js
-- Supports selecting a folder (showDirectoryPicker or fallback webkitdirectory)
-- Non-recursive: only root folder images
-- Two tabs: Manga (grid + modal) and Manhwa (vertical, 70vw, no modal)
-- Gallery thumbnails uniform size via .gallery-item & object-fit: cover
-- Infinite scroll with IntersectionObserver on #sentinel + requestAnimationFrame
-- Batch size fixed = 20
-- Performance Optimization:
-    - createImageBitmap + canvas for Manga thumbnails
-    - Custom visibility-based loader + decoded blob cache for Manhwa (prioritizes back-scroll smoothness)
-    - Deferred Object URL creation + 8s delayed unload with generous cache for ~50 image folders
-- Temporary debug metrics: window.__imgDebug (enable with .enabled = true, use .getStats())
+- Folder: showDirectoryPicker (File System Access API) with webkitdirectory and
+  drag-and-drop fallbacks. Root images are shown; subfolders appear in the
+  Explorer tree and are read on demand.
+- Two modes: Manga (thumbnail grid + zoomable viewer) and Manhwa (continuous
+  vertical strip).
+- Loading: every image gets a cheap placeholder up front, so the scrollbar and
+  jumps cover the whole folder. IntersectionObservers decide what to decode
+  (a queue, at most MAX_ACTIVE_LOADS at once, skipping pages scrolled past)
+  and what to release (UNLOAD_DELAY after leaving UNLOAD_MARGIN).
+- Manhwa placeholders keep each page's real aspect ratio once known, so pages
+  never jump and width changes are one CSS variable.
+- Object URLs: one per File, created on first use, revoked together when
+  another folder opens (they only reference the file; decoded pixels are
+  freed by unloading the element).
 */
 
-// Configure lazysizes for fast scrolling (must be before lazysizes loads)
-window.lazySizesConfig = window.lazySizesConfig || {};
-window.lazySizesConfig.expand = 300; // Preload 300px ahead (reduced from default 370)
-window.lazySizesConfig.expFactor = 1.5; // Expansion factor during idle
-window.lazySizesConfig.hFac = 0.8; // Height factor for horizontal scroll
-window.lazySizesConfig.loadMode = 2; // Load images in view + nearby
-window.lazySizesConfig.throttleDelay = 125; // Throttle scroll events
-
-// === Temporary Performance Debug Instrumentation (Manhwa optimization focus) ===
-// Enable with:  window.__imgDebug.enabled = true
-// View live stats: window.__imgDebug
-// Reset with:   window.__imgDebug.reset()
-const __imgDebug = {
-  enabled: false,
-  liveBlobs: 0,
-  totalCreated: 0,
-  totalRevoked: 0,
-  manhwaDecodes: 0,
-  unloads: 0,
-  reloads: 0,
-  cacheHits: 0,
-  cacheMisses: 0,
-  activeURLs: new Set(),
-
-  _updateLive() {
-    this.liveBlobs = this.activeURLs.size;
-  },
-
-  log(msg, data) {
-    if (this.enabled) {
-      console.log(`[ImgPerf] ${msg}`, data || '');
-    }
-  },
-
-  recordCreate(url, isManhwa = false) {
-    this.totalCreated++;
-    this.activeURLs.add(url);
-    this._updateLive();
-    if (isManhwa) this.manhwaDecodes++;
-    this.log('Blob created', { live: this.liveBlobs, total: this.totalCreated, isManhwa });
-  },
-
-  recordRevoke(url) {
-    this.totalRevoked++;
-    this.activeURLs.delete(url);
-    this._updateLive();
-    this.log('Blob revoked', { live: this.liveBlobs, totalRevoked: this.totalRevoked });
-  },
-
-  recordUnload() {
-    this.unloads++;
-    this.log('Image unloaded (DOM cleared)', { unloads: this.unloads, liveBlobs: this.liveBlobs });
-  },
-
-  recordReload(isCacheHit = false) {
-    this.reloads++;
-    if (isCacheHit) this.cacheHits++; else this.cacheMisses++;
-    this.log('Image reloaded', { reloads: this.reloads, hits: this.cacheHits, misses: this.cacheMisses });
-  },
-
-  reset() {
-    this.liveBlobs = 0;
-    this.totalCreated = 0;
-    this.totalRevoked = 0;
-    this.manhwaDecodes = 0;
-    this.unloads = 0;
-    this.reloads = 0;
-    this.cacheHits = 0;
-    this.cacheMisses = 0;
-    this.activeURLs.clear();
-    this.log('Debug stats reset');
-  },
-
-  getStats() {
-    return {
-      liveBlobs: this.liveBlobs,
-      renderedImages: renderedImages.size,
-      manhwaCacheSize: manhwaImageCache.size,
-      totalCreated: this.totalCreated,
-      totalRevoked: this.totalRevoked,
-      unloads: this.unloads,
-      reloads: this.reloads,
-      cacheHits: this.cacheHits,
-      cacheMisses: this.cacheMisses,
-      manhwaDecodes: this.manhwaDecodes
-    };
-  }
-};
-
-window.__imgDebug = __imgDebug;
-// === End Debug Instrumentation ===
-
-// === Manhwa Image Cache (Phase 2) - prioritizes back-scroll smoothness for ~50 images ===
-// Keeps recently decoded blob URLs alive so scrolling back is near-instant.
-const manhwaImageCache = new Map(); // filename -> {url, lastUsed}
-const MAX_MANHWA_CACHE_SIZE = 28; // Generous for target size + smoothness priority
-
-function getCachedManhwaURL(file) {
-  const entry = manhwaImageCache.get(file.name);
-  if (entry) {
-    entry.lastUsed = Date.now();
-    __imgDebug.cacheHits++;
-    __imgDebug.log('Cache HIT for Manhwa image', file.name);
-    return entry.url;
-  }
-  __imgDebug.cacheMisses++;
-  return null;
-}
-
-// Check if a blob URL is still actively used by a visible <img> in the DOM
-function isBlobURLInUseByDOM(url) {
-  const images = gallery.querySelectorAll('img');
-  for (const img of images) {
-    if (img.src === url) return true;
-  }
-  return false;
-}
-
-function cacheManhwaURL(file, url) {
-  // Evict oldest if over limit
-  if (manhwaImageCache.size >= MAX_MANHWA_CACHE_SIZE) {
-    let oldestKey = null;
-    let oldestTime = Infinity;
-    for (const [key, val] of manhwaImageCache) {
-      if (val.lastUsed < oldestTime) {
-        oldestTime = val.lastUsed;
-        oldestKey = key;
-      }
-    }
-    if (oldestKey) {
-      const oldEntry = manhwaImageCache.get(oldestKey);
-      if (oldEntry) {
-        // Only revoke if no DOM <img> still references this blob URL
-        if (!isBlobURLInUseByDOM(oldEntry.url)) {
-          __imgDebug.recordRevoke(oldEntry.url);
-          URL.revokeObjectURL(oldEntry.url);
-          objectURLs.delete(oldEntry.url);
-        } else {
-          __imgDebug.log('Skipped revoke — blob URL still in use by DOM', oldEntry.url);
-          // Still tracked in objectURLs for cleanup on clear/reset
-        }
-      }
-      manhwaImageCache.delete(oldestKey);
-    }
-  }
-
-  manhwaImageCache.set(file.name, { url, lastUsed: Date.now() });
-  __imgDebug.log('Cached Manhwa image', file.name);
-}
-
-function clearManhwaCache() {
-  for (const [key, entry] of manhwaImageCache) {
-    __imgDebug.recordRevoke(entry.url);
-    URL.revokeObjectURL(entry.url);
-    objectURLs.delete(entry.url);
-  }
-  manhwaImageCache.clear();
-  __imgDebug.log('Manhwa cache cleared');
-}
-
-// === End Manhwa Cache ===
+const LOAD_MARGIN = "1200px 0px"; // decode this far ahead of the viewport
+const UNLOAD_MARGIN = "5000px 0px"; // keep decoded pages this close
+const UNLOAD_DELAY = 8000; // ms offscreen before releasing a page
+const MAX_ACTIVE_LOADS = 4; // concurrent decodes
 
 const chooseInput = document.getElementById("chooseFolder");
-const chooseLabel = document.getElementById("chooseLabel");
+const openFolderBtn = document.getElementById("openFolderBtn");
 const clearBtn = document.getElementById("clearBtn");
 
 const mangaTab = document.getElementById("mangaTab");
@@ -190,58 +36,50 @@ const increaseManhwaWidth = document.getElementById("increaseManhwaWidth");
 const manhwaWidthValue = document.getElementById("manhwaWidthValue");
 
 const gallery = document.getElementById("gallery");
-
+const emptyState = document.getElementById("emptyState");
 const mainBody = document.getElementById("mainBody");
 
-// Theme Toggle Logic
+// Theme Toggle Logic (saved theme is applied by the inline script in <head>)
 const themeToggleBtn = document.getElementById("themeToggleBtn");
 const htmlElement = document.documentElement;
 
-const savedTheme = localStorage.getItem("theme") || "dark";
-if (savedTheme === "light") {
-  htmlElement.setAttribute("data-theme", "light");
-}
-updateThemeIcon(savedTheme);
-
-function updateThemeIcon(theme) {
-  if (themeToggleBtn) {
-    const icon = themeToggleBtn.querySelector(".icon");
-    // If light mode is active, icon should be Moon (to switch back to dark)
-    // If dark mode is active, icon should be Sun (to switch to light)
-    icon.textContent = theme === "light" ? "🌙" : "☀️";
+themeToggleBtn.addEventListener("click", () => {
+  const newTheme =
+    htmlElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+  if (newTheme === "light") {
+    htmlElement.setAttribute("data-theme", "light");
+  } else {
+    htmlElement.removeAttribute("data-theme");
   }
+  localStorage.setItem("theme", newTheme);
+});
+
+// Phones get a full-width strip; desktops keep the 30% reading column.
+let maxWidthVW = window.matchMedia("(max-width: 768px)").matches ? 100 : 30;
+
+let mode = "manhwa"; // 'manga' or 'manhwa'
+let fileObjects = []; // Files shown in the gallery (current folder)
+
+const objectURLs = new Map(); // File -> blob URL
+const imageDimensionsCache = new Map(); // File -> natural {width, height} (Manhwa)
+
+function getObjectURL(file) {
+  let url = objectURLs.get(file);
+  if (!url) {
+    url = URL.createObjectURL(file);
+    objectURLs.set(file, url);
+  }
+  return url;
 }
 
-if (themeToggleBtn) {
-  themeToggleBtn.addEventListener("click", () => {
-    const currentTheme =
-      htmlElement.getAttribute("data-theme") === "light" ? "light" : "dark";
-    const newTheme = currentTheme === "light" ? "dark" : "light";
-
-    if (newTheme === "light") {
-      htmlElement.setAttribute("data-theme", "light");
-    } else {
-      htmlElement.removeAttribute("data-theme");
-    }
-
-    localStorage.setItem("theme", newTheme);
-    updateThemeIcon(newTheme);
-  });
+function revokeObjectURLs() {
+  objectURLs.forEach((url) => URL.revokeObjectURL(url));
+  objectURLs.clear();
 }
-
-let maxWidthVW = 30; // default for manhwa
-
-const BATCH_SIZE = 20;
-const INITIAL_EAGER_COUNT = 10;
-
-// Virtual scrolling and performance optimization
-const imageDimensionsCache = new Map(); // Cache image dimensions {name: {width, height}}
-const renderedImages = new Set(); // Track which images are currently in DOM
-const objectURLs = new Set(); // Track Object URLs for memory cleanup
 
 // modal elements (for Manga)
 const modal = document.getElementById("modal");
-const modalContent = document.getElementById("modalContent");
+const imageWrapper = document.getElementById("imageWrapper");
 const modalImage = document.getElementById("modalImage");
 const prevBtn = document.getElementById("prevBtn");
 const nextBtn = document.getElementById("nextBtn");
@@ -249,174 +87,9 @@ const zoomInBtn = document.getElementById("zoomInBtn");
 const zoomOutBtn = document.getElementById("zoomOutBtn");
 const resetZoomBtn = document.getElementById("resetZoomBtn");
 const closeModalBtn = document.getElementById("closeModalBtn");
+const zoomIndicator = document.getElementById("zoomIndicator");
 
-let mode = "manhwa"; // 'manga' or 'manhwa'
-let fileObjects = []; // Array of File objects directly
-let currentIndex = 0; // index for batch loading
-let isBatchLoading = false; // Prevent concurrent loading
-let currentRAF = null; // Track current RAF to cancel on reset
-let isInitialLoadInProgress = false;
-
-// Unload Observer for Virtual Scrolling / DOM Cleanup
-let unloadObserver = null;
-let unloadDebounceTimer = null;
-function initUnloadObserver() {
-  if (unloadObserver) {
-    unloadObserver.disconnect();
-  }
-  // Pending unloads: debounce to avoid unloading items the user might scroll back to
-  const pendingUnloads = new Map();
-  const UNLOAD_DELAY = 8000; // 8s delay before actually unloading
-
-  unloadObserver = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      const wrapper = entry.target;
-      if (!entry.isIntersecting) {
-        // Schedule deferred unload — don't unload immediately
-        if (!wrapper.classList.contains('is-unloaded') && wrapper._file) {
-          if (!pendingUnloads.has(wrapper)) {
-            const timerId = setTimeout(() => {
-              pendingUnloads.delete(wrapper);
-              // Double-check it's still offscreen before unloading
-              if (wrapper.classList.contains('is-unloaded') || !wrapper._file) return;
-              const rect = wrapper.getBoundingClientRect();
-              if (rect.width > 0 && rect.height > 0) {
-                wrapper.style.width = `${rect.width}px`;
-                wrapper.style.height = `${rect.height}px`;
-              }
-              const img = wrapper.querySelector('img');
-              if (img && img.src && img.src.startsWith('blob:')) {
-                // For Manhwa: move to cache instead of revoking (smoothness priority)
-                if (mode === "manhwa" && wrapper._file) {
-                  if (!manhwaImageCache.has(wrapper._file.name)) {
-                    cacheManhwaURL(wrapper._file, img.src);
-                  }
-                  // Keep the blob alive in cache; do not revoke here
-                  objectURLs.delete(img.src); // still remove from bulk tracking
-                } else {
-                  __imgDebug.recordRevoke(img.src);
-                  URL.revokeObjectURL(img.src);
-                  objectURLs.delete(img.src);
-                }
-              }
-              wrapper.innerHTML = '';
-              wrapper.classList.add('is-unloaded');
-              renderedImages.delete(wrapper);
-              __imgDebug.recordUnload();
-            }, UNLOAD_DELAY);
-            pendingUnloads.set(wrapper, timerId);
-          }
-        }
-      } else {
-        // Cancel any pending unload if scrolled back into view
-        if (pendingUnloads.has(wrapper)) {
-          clearTimeout(pendingUnloads.get(wrapper));
-          pendingUnloads.delete(wrapper);
-        }
-        // Scrolled back into view: Reload if was unloaded
-        if (wrapper.classList.contains('is-unloaded') && wrapper._file) {
-          wrapper.classList.remove('is-unloaded');
-          const inner = createInnerElement(wrapper._file);
-          wrapper.appendChild(inner);
-          if (mode === "manhwa" && manhwaLoadObserver) {
-            manhwaLoadObserver.observe(wrapper);
-          }
-          // Immediately try to load (will hit cache for fast back-scroll)
-          if (mode === "manhwa") {
-            ensureManhwaImageLoaded(wrapper);
-          }
-          __imgDebug.recordReload(!!(wrapper._file && manhwaImageCache.has(wrapper._file.name)));
-        }
-      }
-    });
-  }, {
-    root: mainBody,
-    rootMargin: "5000px" // Larger buffer: only unload items very far offscreen
-  });
-}
-
-// Dedicated loader for Manhwa images (replaces lazysizes for this path)
-// Uses IntersectionObserver with generous margin for pre-loading → better back-scroll smoothness
-let manhwaLoadObserver = null;
-
-function initManhwaLoadObserver() {
-  if (manhwaLoadObserver) {
-    manhwaLoadObserver.disconnect();
-  }
-
-  manhwaLoadObserver = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        const wrapper = entry.target;
-        ensureManhwaImageLoaded(wrapper);
-      }
-    });
-  }, {
-    root: mainBody,
-    rootMargin: "1200px 0px", // Preload well ahead for smooth scrolling
-    threshold: 0.01
-  });
-}
-
-function ensureManhwaImageLoaded(wrapper) {
-  if (!wrapper || mode !== "manhwa" || !wrapper._file) return;
-
-  let img = wrapper.querySelector("img");
-
-  // If unloaded or no img, recreate the skeleton placeholder
-  if (!img || wrapper.classList.contains("is-unloaded")) {
-    if (wrapper.classList.contains("is-unloaded")) {
-      wrapper.classList.remove("is-unloaded");
-    }
-    img = createInnerElement(wrapper._file);
-    wrapper.innerHTML = "";
-    wrapper.appendChild(img);
-  }
-
-  // If we still have the file reference (we clear _file after loading the real image), load it now
-  if (img && img._file) {
-    let url = getCachedManhwaURL(img._file);
-
-    if (!url) {
-      // Cache miss → create new
-      url = URL.createObjectURL(img._file);
-      objectURLs.add(url);
-      __imgDebug.recordCreate(url, true);
-      cacheManhwaURL(img._file, url);
-    } else {
-      // Re-use cached URL (no new decode)
-      // Still track in objectURLs for bulk cleanup on clear
-      if (!objectURLs.has(url)) objectURLs.add(url);
-    }
-
-    img.src = url;
-    img._file = null; // Release reference
-
-    // Handle visual state immediately on cache hit (load event may not fire for cached blobs)
-    if (img.complete) {
-      img.classList.remove("skeleton-loading");
-      img.classList.add("lazyloaded");
-      if (img.parentElement) img.parentElement.style.height = '';
-    }
-    // Otherwise the "load" listener will catch it
-  }
-}
-
-// modal state
-let currentModalIndex = -1;
-let currentFullResUrl = null; // Track current blob URL to revoke
-let zoomed = false;
-let scale = 1;
-let translateX = 0;
-let translateY = 0;
-let originX = 50;
-let originY = 50;
-
-let isDragging = false;
-let dragStartX = 0;
-let dragStartY = 0;
-
-// === New continuous zoom system (Manga modal) ===
+// === Continuous zoom system (Manga modal) ===
 const ZOOM_MIN = 0.1;
 const ZOOM_MAX = 20;
 const ZOOM_WHEEL_FACTOR = 0.0015; // wheel deltaY * this → log scale step (smooth)
@@ -437,8 +110,8 @@ function naturalCompare(a, b) {
 
   // Extract all numbers appearing in the name (e.g. "Chap514" → [514], "Chap 1" → [1])
   // This makes "sort by number in name" actually work even when spacing/punctuation differs
-  const aNums = (aStr.match(/\d+/g) || []).map(n => parseInt(n, 10));
-  const bNums = (bStr.match(/\d+/g) || []).map(n => parseInt(n, 10));
+  const aNums = (aStr.match(/\d+/g) || []).map((n) => parseInt(n, 10));
+  const bNums = (bStr.match(/\d+/g) || []).map((n) => parseInt(n, 10));
 
   const len = Math.min(aNums.length, bNums.length);
   for (let i = 0; i < len; i++) {
@@ -457,202 +130,457 @@ function naturalCompare(a, b) {
 }
 
 function compareFolderNames(x, y) {
-  const na = x && x.name ? x.name : (typeof x === "string" ? x : "");
-  const nb = y && y.name ? y.name : (typeof y === "string" ? y : "");
+  const na = x && x.name ? x.name : typeof x === "string" ? x : "";
+  const nb = y && y.name ? y.name : typeof y === "string" ? y : "";
   if (explorerSortMode === "natural") {
     return naturalCompare(na, nb);
   }
   return na.localeCompare(nb);
 }
 
-const sidebar = document.getElementById("sidebar");
-let subfolders = []; // [{name, handle}]
-let currentFolderHandle = null;
-let currentSubfolder = null;
-let currentImageFolderHandle = null;
-let rootFileObjects = [];
-let explorerSortMode = localStorage.getItem("explorerSortMode") === "natural" ? "natural" : "string";
+/* ---------- Gallery: placeholders, load queue, deferred unload ---------- */
 
-// Sidebar Trigger Logic
-const sidebarTrigger = document.querySelector(".sidebar-trigger"); // Select via class since it has no ID
-if (sidebarTrigger) {
-  sidebarTrigger.addEventListener("click", (e) => {
-    e.stopPropagation(); // Prevent document click from closing it immediately
-    sidebar.classList.toggle("open");
-  });
+let loadObserver = null;
+let unloadObserver = null;
+const loadQueue = new Set(); // items waiting for a decode slot, nearest first
+let activeLoads = 0;
+let loadGeneration = 0; // bumped on reset so stale loads don't free new slots
+
+function initObservers() {
+  loadObserver = new IntersectionObserver(
+    (entries) => {
+      const bounds = entries[0].rootBounds;
+      const middle = bounds ? bounds.top + bounds.height / 2 : 0;
+      const distance = (entry) =>
+        Math.abs(
+          entry.boundingClientRect.top + entry.boundingClientRect.height / 2 - middle,
+        );
+      const entering = [];
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          if (!entry.target._load) entering.push(entry);
+        } else {
+          // Scrolled past before its turn: skip the decode entirely.
+          loadQueue.delete(entry.target);
+        }
+      }
+      entering
+        .sort((a, b) => distance(a) - distance(b))
+        .forEach((entry) => loadQueue.add(entry.target));
+      pumpLoadQueue();
+    },
+    { root: mainBody, rootMargin: LOAD_MARGIN },
+  );
+
+  unloadObserver = new IntersectionObserver(
+    (entries) => {
+      for (const { target, isIntersecting } of entries) {
+        clearTimeout(target._unloadTimer);
+        // Deferred: unloading the moment a page leaves would stutter quick back-scrolls.
+        if (!isIntersecting && (target._load || target.firstElementChild)) {
+          target._unloadTimer = setTimeout(() => unloadItem(target), UNLOAD_DELAY);
+        }
+      }
+    },
+    { root: mainBody, rootMargin: UNLOAD_MARGIN },
+  );
 }
+
+function pumpLoadQueue() {
+  for (const item of loadQueue) {
+    if (activeLoads >= MAX_ACTIVE_LOADS) return;
+    loadQueue.delete(item);
+    if (item._load) continue;
+    activeLoads++;
+    const generation = loadGeneration;
+    loadItem(item).finally(() => {
+      if (generation !== loadGeneration) return;
+      activeLoads--;
+      pumpLoadQueue();
+    });
+  }
+}
+
+async function loadItem(item) {
+  if (item._load || !item.isConnected) return;
+  const token = (item._load = {});
+  if (!item.firstElementChild) item.classList.add("is-loading");
+
+  try {
+    const isManhwa = item.classList.contains("manhwa-item");
+    const content = isManhwa
+      ? await decodeManhwaImage(item._file)
+      : await renderThumbnail(item);
+
+    if (item._load !== token || !item.isConnected) {
+      releaseContent(content); // unloaded or folder changed while decoding
+      return;
+    }
+    if (isManhwa) applyNaturalSize(item, content);
+    releaseContent(item.firstElementChild);
+    item.replaceChildren(content);
+    item.classList.add("is-loaded");
+  } catch (err) {
+    if (item._load !== token) return;
+    console.warn("Cannot display image", item._file.name, err);
+    item.dataset.error = `Cannot display ${item._file.name}`;
+    item.classList.add("is-error");
+  } finally {
+    if (item._load === token) item.classList.remove("is-loading");
+  }
+}
+
+async function decodeManhwaImage(file) {
+  const img = document.createElement("img");
+  img.alt = file.name;
+  img.decoding = "async";
+  img.src = getObjectURL(file);
+  await img.decode(); // decoded before it is shown: no blank flash while scrolling
+  return img;
+}
+
+function applyNaturalSize(item, img) {
+  const { naturalWidth: width, naturalHeight: height } = img;
+  if (!width || !height) return;
+  imageDimensionsCache.set(item._file, { width, height });
+  const ratio = `${width} / ${height}`;
+  item.style.aspectRatio = ratio;
+  // The first known page shape is the best estimate for pages not decoded yet.
+  if (!gallery.style.getPropertyValue("--manhwa-ratio")) {
+    gallery.style.setProperty("--manhwa-ratio", ratio);
+  }
+}
+
+// Manga thumbnails: decode straight to the cell size (off the main thread).
+async function renderThumbnail(item) {
+  const file = item._file;
+  try {
+    const bitmap = await createImageBitmap(file, {
+      resizeWidth: Math.round((item.clientWidth || 300) * (window.devicePixelRatio || 1)),
+      resizeQuality: "high",
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    canvas.getContext("bitmaprenderer").transferFromImageBitmap(bitmap);
+    return canvas;
+  } catch (err) {
+    // createImageBitmap cannot decode some formats (e.g. SVG); let <img> try.
+    const img = document.createElement("img");
+    img.alt = "";
+    img.src = getObjectURL(file);
+    await img.decode();
+    return img;
+  }
+}
+
+// Free pixels now instead of waiting for garbage collection.
+function releaseContent(content) {
+  if (!content) return;
+  if (content.tagName === "CANVAS") {
+    content.getContext("bitmaprenderer").transferFromImageBitmap(null);
+  } else {
+    content.removeAttribute("src");
+  }
+}
+
+function unloadItem(item) {
+  clearTimeout(item._unloadTimer);
+  item._load = null;
+  releaseContent(item.firstElementChild);
+  item.replaceChildren();
+  item.classList.remove("is-loaded", "is-loading", "is-error");
+}
+
+function createItem(file, index) {
+  const isManga = mode === "manga";
+  const item = document.createElement(isManga ? "button" : "div");
+  item.className = isManga ? "gallery-item" : "manhwa-item";
+  item._file = file;
+  item._index = index;
+  if (isManga) {
+    item.type = "button";
+    item.setAttribute("aria-label", `Open ${file.name}`);
+  } else {
+    const size = imageDimensionsCache.get(file);
+    if (size) item.style.aspectRatio = `${size.width} / ${size.height}`;
+  }
+  return item;
+}
+
+/* ---------- Reset and load ---------- */
+function resetGallery() {
+  if (loadObserver) loadObserver.disconnect();
+  if (unloadObserver) unloadObserver.disconnect();
+  loadQueue.clear();
+  loadGeneration++;
+  activeLoads = 0;
+  for (const item of gallery.children) unloadItem(item);
+
+  gallery.replaceChildren();
+  gallery.style.removeProperty("--manhwa-ratio");
+  gallery.className =
+    mode === "manhwa" ? "manhwa-list" : `gallery layout-${thumbSizeSelect.value}`;
+  mainBody.scrollTop = 0;
+  emptyState.hidden = fileObjects.length > 0;
+  if (fileObjects.length === 0) return;
+
+  initObservers();
+  const fragment = document.createDocumentFragment();
+  fileObjects.forEach((file, index) => fragment.appendChild(createItem(file, index)));
+  gallery.appendChild(fragment);
+  for (const item of gallery.children) {
+    loadObserver.observe(item);
+    unloadObserver.observe(item);
+  }
+}
+
+function showFolderImages(dirHandle, files) {
+  currentImageFolderHandle = dirHandle;
+  revokeObjectURLs();
+  imageDimensionsCache.clear();
+  fileObjects = files;
+  resetGallery();
+}
+
+// Manga: one delegated listener instead of one per thumbnail
+gallery.addEventListener("click", (e) => {
+  const item = e.target.closest(".gallery-item");
+  if (item) openModal(item._index);
+});
+
+/* ---------- Tab switching ---------- */
+function setMode(nextMode) {
+  if (mode === nextMode) return;
+  mode = nextMode;
+  mangaTab.classList.toggle("active", mode === "manga");
+  manhwaTab.classList.toggle("active", mode === "manhwa");
+  mangaTab.setAttribute("aria-pressed", String(mode === "manga"));
+  manhwaTab.setAttribute("aria-pressed", String(mode === "manhwa"));
+  setSizeControlMode(mode, manhwaWidthControl, mangaSizeControl);
+  resetGallery();
+}
+
+mangaTab.addEventListener("click", () => setMode("manga"));
+manhwaTab.addEventListener("click", () => setMode("manhwa"));
+setSizeControlMode(mode, manhwaWidthControl, mangaSizeControl);
+
+/* ---------- Thumb size control ---------- */
+thumbSizeSelect.addEventListener("change", () => {
+  if (mode !== "manga") return;
+  gallery.className = `gallery layout-${thumbSizeSelect.value}`;
+  // Thumbnails are decoded at cell size: redo the ones that would now be upscaled.
+  const pixelRatio = window.devicePixelRatio || 1;
+  for (const item of gallery.children) {
+    const thumb = item.firstElementChild;
+    if (thumb && thumb.tagName === "CANVAS" && thumb.width < item.clientWidth * pixelRatio) {
+      item._load = null; // keep the old thumbnail visible until the sharper one is ready
+      loadObserver.unobserve(item);
+      loadObserver.observe(item);
+    }
+  }
+});
+
+/* ---------- Manhwa width control ---------- */
+function syncManhwaWidthControl() {
+  gallery.style.setProperty("--manhwa-width", `${maxWidthVW}vw`);
+  manhwaWidthValue.textContent = `${maxWidthVW}%`;
+  decreaseManhwaWidth.disabled = maxWidthVW === 10;
+  increaseManhwaWidth.disabled = maxWidthVW === 100;
+}
+
+function changeManhwaWidth(direction) {
+  maxWidthVW = stepManhwaWidth(maxWidthVW, direction);
+  syncManhwaWidthControl();
+}
+
+decreaseManhwaWidth.addEventListener("click", () => changeManhwaWidth(-1));
+increaseManhwaWidth.addEventListener("click", () => changeManhwaWidth(1));
+syncManhwaWidthControl();
+
+/* ---------- Sidebar ---------- */
+const sidebar = document.getElementById("sidebar");
+const sidebarContent = sidebar.querySelector(".sidebar-content");
+const sidebarTrigger = document.getElementById("sidebarTrigger");
+let subfolders = []; // [{name, handle}]
+let currentFolderHandle = null; // Explorer root
+let currentImageFolderHandle = null; // folder whose images are shown
+let rootFileObjects = [];
+let explorerSortMode =
+  localStorage.getItem("explorerSortMode") === "natural" ? "natural" : "string";
+
+function setSidebarOpen(open) {
+  sidebar.classList.toggle("open", open);
+  sidebarTrigger.setAttribute("aria-expanded", String(open));
+}
+
+sidebarTrigger.addEventListener("click", (e) => {
+  e.stopPropagation(); // Prevent document click from closing it immediately
+  setSidebarOpen(!sidebar.classList.contains("open"));
+});
 
 // Close sidebar when clicking outside (if not pinned)
 document.addEventListener("click", (e) => {
   if (
     sidebar.classList.contains("open") &&
     !sidebar.contains(e.target) &&
-    !sidebarTrigger.contains(e.target)
+    !sidebarTrigger.contains(e.target) &&
+    !contextMenu.contains(e.target)
   ) {
-    sidebar.classList.remove("open");
+    setSidebarOpen(false);
   }
 });
 
-// Context Menu elements (declared in outer scope so they're accessible everywhere)
+// Context Menu
 const contextMenu = document.getElementById("contextMenu");
 const ctxOpen = document.getElementById("ctxOpen");
 const ctxSetRoot = document.getElementById("ctxSetRoot");
 let activeCtxNode = null;
 
-// Global hide context menu
-document.addEventListener("click", () => {
-  if (contextMenu) contextMenu.style.display = "none";
+function hideContextMenu() {
+  contextMenu.hidden = true;
+}
+
+document.addEventListener("click", hideContextMenu);
+// Capture: scrolls of the gallery or sidebar don't bubble to document.
+document.addEventListener("scroll", hideContextMenu, true);
+window.addEventListener("resize", hideContextMenu);
+window.addEventListener("blur", hideContextMenu);
+
+function showContextMenu(e, node, button) {
+  e.preventDefault();
+  e.stopPropagation();
+  activeCtxNode = { ...node, button };
+  contextMenu.hidden = false;
+
+  // Keyboard-opened menus (Shift+F10) carry no pointer position: anchor to the button.
+  let x = e.clientX;
+  let y = e.clientY;
+  if (!x && !y) {
+    const anchor = button.getBoundingClientRect();
+    x = anchor.left + 16;
+    y = anchor.bottom;
+  }
+  const rect = contextMenu.getBoundingClientRect();
+  contextMenu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - rect.width - 8))}px`;
+  contextMenu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - rect.height - 8))}px`;
+  ctxOpen.focus();
+}
+
+ctxOpen.addEventListener("click", () => {
+  if (activeCtxNode) activeCtxNode.button.click();
 });
-document.addEventListener("scroll", () => {
-  if (contextMenu) contextMenu.style.display = "none";
+
+ctxSetRoot.addEventListener("click", () => {
+  if (activeCtxNode) openRootFolder(activeCtxNode.handle).catch(reportFolderError);
 });
 
 // Sidebar Resize Logic
 const resizer = document.getElementById("sidebarResizer");
-if (resizer) {
-  let isResizing = false;
-
-  // Restore saved width
-  const savedWidth = localStorage.getItem("sidebarWidth");
-  if (savedWidth) {
-    document.documentElement.style.setProperty(
-      "--sidebar-width",
-      savedWidth + "px",
-    );
-  }
-
-  resizer.addEventListener("mousedown", (e) => {
-    isResizing = true;
-    sidebar.classList.add("is-resizing");
-    resizer.classList.add("is-resizing");
-    document.body.classList.add("is-resizing");
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", stopResizing);
-    e.preventDefault();
-  });
-
-  function handleMouseMove(e) {
-    if (!isResizing) return;
-    const offset = sidebar.classList.contains("pinned") ? 0 : 10;
-    let newWidth = e.clientX - offset;
-
-    // Bounds
-    if (newWidth < 250) newWidth = 250;
-    if (newWidth > 600) newWidth = 600;
-
-    document.documentElement.style.setProperty(
-      "--sidebar-width",
-      `${newWidth}px`,
-    );
-  }
-
-  function stopResizing() {
-    isResizing = false;
-    sidebar.classList.remove("is-resizing");
-    resizer.classList.remove("is-resizing");
-    document.body.classList.remove("is-resizing");
-    document.removeEventListener("mousemove", handleMouseMove);
-    document.removeEventListener("mouseup", stopResizing);
-
-    // Save final width
-    const currentWidth = getComputedStyle(
-      document.documentElement,
-    ).getPropertyValue("--sidebar-width");
-    localStorage.setItem("sidebarWidth", parseInt(currentWidth));
-  }
+const savedWidth = localStorage.getItem("sidebarWidth");
+if (savedWidth) {
+  htmlElement.style.setProperty("--sidebar-width", `${savedWidth}px`);
 }
 
-// Reload Folder Action
+resizer.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  resizer.setPointerCapture(e.pointerId);
+  resizer.classList.add("is-resizing");
+  document.body.classList.add("is-resizing");
+});
+
+resizer.addEventListener("pointermove", (e) => {
+  if (!resizer.hasPointerCapture(e.pointerId)) return;
+  const left = sidebar.getBoundingClientRect().left;
+  const newWidth = Math.min(600, Math.max(250, e.clientX - left));
+  htmlElement.style.setProperty("--sidebar-width", `${newWidth}px`);
+});
+
+resizer.addEventListener("lostpointercapture", () => {
+  resizer.classList.remove("is-resizing");
+  document.body.classList.remove("is-resizing");
+  const currentWidth = getComputedStyle(htmlElement).getPropertyValue("--sidebar-width");
+  localStorage.setItem("sidebarWidth", parseInt(currentWidth, 10));
+});
+
+// Sidebar Pin
+const sidebarPin = document.getElementById("sidebarPin");
+
+function setSidebarPinned(pinned) {
+  sidebar.classList.toggle("pinned", pinned);
+  sidebarPin.classList.toggle("pinned", pinned);
+  sidebarPin.title = pinned ? "Unpin sidebar" : "Pin sidebar";
+  sidebarPin.setAttribute("aria-pressed", String(pinned));
+  document.body.classList.toggle("sidebar-pinned", pinned);
+}
+
+setSidebarPinned(localStorage.getItem("sidebarPinned") === "true");
+
+sidebarPin.addEventListener("click", () => {
+  const pinned = !sidebar.classList.contains("pinned");
+  setSidebarPinned(pinned);
+  localStorage.setItem("sidebarPinned", pinned);
+});
+
+// Reload Folder Action: re-read the tree and keep showing the same folder
 const sidebarReload = document.getElementById("sidebarReload");
-if (sidebarReload) {
-  sidebarReload.addEventListener("click", async () => {
-    if (!currentFolderHandle) return;
+sidebarReload.addEventListener("click", async () => {
+  if (!currentFolderHandle) return;
 
-    const svg = sidebarReload.querySelector("svg");
-    if (svg) {
-      svg.style.transition = "transform 0.5s ease";
-      svg.style.transform = "rotate(360deg)";
-      setTimeout(() => {
-        svg.style.transition = "none";
-        svg.style.transform = "rotate(0deg)";
-      }, 500);
-    }
+  sidebarReload
+    .querySelector("svg")
+    .animate([{ transform: "rotate(0deg)" }, { transform: "rotate(360deg)" }], {
+      duration: 500,
+      easing: "ease",
+    });
 
-    const savedSubfolder = currentSubfolder;
-    await handleDirectoryHandle(currentFolderHandle);
-
-    if (savedSubfolder) {
-      await new Promise(resolve => requestAnimationFrame(resolve));
-      const btns = Array.from(sidebar.querySelectorAll(".folder-btn"));
-      const targetBtn = btns.find(b => b.textContent.trim() === savedSubfolder);
-      if (targetBtn) {
-        targetBtn.click();
-      }
-    }
-  });
-}
+  const viewHandle = currentImageFolderHandle;
+  const viewingRoot = viewHandle === currentFolderHandle;
+  try {
+    const contents = await readFolderContents(currentFolderHandle);
+    rootFileObjects = contents.files;
+    subfolders = contents.folders;
+    const viewFiles = viewingRoot
+      ? contents.files
+      : (await readFolderContents(viewHandle)).files;
+    showFolderImages(viewHandle, viewFiles);
+    renderSidebarTree();
+    if (!viewingRoot) await markActiveFolder(viewHandle);
+  } catch (err) {
+    reportFolderError(err);
+  }
+});
 
 // Sidebar Sort Toggle (only affects folder tree in explorer — per user requirement)
-function updateSortButtonUI(btn) {
-  if (!btn) return;
+const sidebarSort = document.getElementById("sidebarSort");
+
+function updateSortButtonUI() {
   if (explorerSortMode === "natural") {
-    btn.textContent = "🔢";
-    btn.title = "Natural sort (by number in name) — click to use A-Z string sort";
+    sidebarSort.textContent = "1–9";
+    sidebarSort.title = "Natural sort (by number in name) — click to use A-Z string sort";
   } else {
-    btn.textContent = "🔤";
-    btn.title = "A-Z string sort — click to use natural sort by number";
+    sidebarSort.textContent = "A–Z";
+    sidebarSort.title = "A-Z string sort — click to use natural sort by number";
   }
 }
 
-const sidebarSort = document.getElementById("sidebarSort");
-if (sidebarSort) {
-  sidebarSort.addEventListener("click", async () => {
-    explorerSortMode = explorerSortMode === "string" ? "natural" : "string";
-    localStorage.setItem("explorerSortMode", explorerSortMode);
-    updateSortButtonUI(sidebarSort);
+sidebarSort.addEventListener("click", () => {
+  explorerSortMode = explorerSortMode === "string" ? "natural" : "string";
+  localStorage.setItem("explorerSortMode", explorerSortMode);
+  updateSortButtonUI();
 
-    if (currentFolderHandle) {
-      const savedSubfolder = currentSubfolder;
-      await renderSidebarTree();
+  // Re-order rendered folders in place so expanded folders and the selection survive.
+  subfolders.sort(compareFolderNames);
+  for (const container of sidebar.querySelectorAll(".folder-tree-children")) {
+    const nodes = Array.from(container.children).filter((child) => child._node);
+    nodes.sort((a, b) => compareFolderNames(a._node, b._node));
+    container.prepend(...nodes);
+  }
+});
 
-      if (savedSubfolder) {
-        await new Promise((resolve) => requestAnimationFrame(resolve));
-        const btns = Array.from(sidebar.querySelectorAll(".folder-btn"));
-        const targetBtn = btns.find((b) => b.textContent.trim() === savedSubfolder);
-        if (targetBtn) {
-          targetBtn.click();
-        }
-      }
-    }
-  });
+updateSortButtonUI();
 
-  updateSortButtonUI(sidebarSort);
-}
-
-// Context Menu Actions
-if (ctxOpen) {
-  ctxOpen.onclick = () => {
-    if (activeCtxNode) {
-      const btn = Array.from(sidebar.querySelectorAll(".folder-btn")).find(
-        (b) => b.textContent.trim() === activeCtxNode.name,
-      );
-      if (btn) btn.click();
-    }
-  };
-}
-
-if (ctxSetRoot) {
-  ctxSetRoot.onclick = async () => {
-    if (activeCtxNode && activeCtxNode.handle) {
-      currentFolderHandle = activeCtxNode.handle;
-      currentSubfolder = null;
-      resetAndLoad();
-      await renderSidebarTree();
-    }
-  };
-}
-
-// Hàm duyệt folder, lấy file ảnh ở root và danh sách folder con
+/* ---------- Folder reading ---------- */
 async function folderHandlesMatch(first, second) {
   if (!first || !second) return false;
   if (first === second) return true;
@@ -672,82 +600,51 @@ async function folderHandlesMatch(first, second) {
   );
 }
 
+// Image files at this level (reading order) and its subfolders
 async function readFolderContents(dirHandle) {
-  const files = [];
+  const fileHandles = [];
   const folders = [];
 
   for await (const [name, handle] of dirHandle.entries()) {
     if (handle.kind === "file" && isImageName(name)) {
-      try {
-        files.push(await handle.getFile());
-      } catch (err) {
-        console.warn("Cannot read file", name, err);
-      }
+      fileHandles.push(handle);
     } else if (handle.kind === "directory") {
       folders.push({ name, handle });
     }
   }
 
-  files.sort((a, b) => a.name.localeCompare(b.name));
-  folders.sort((a, b) => compareFolderNames(a, b));
-  return { files, folders };
+  // getFile() in parallel: one await per file made big folders slow to open.
+  const files = await Promise.all(
+    fileHandles.map((handle) =>
+      handle.getFile().catch((err) => {
+        console.warn("Cannot read file", handle.name, err);
+        return null;
+      }),
+    ),
+  );
+
+  return {
+    files: files.filter(Boolean).sort(compareFileNames),
+    folders: folders.sort(compareFolderNames),
+  };
 }
 
-async function handleDirectoryHandle(dirHandle) {
-  if (currentFullResUrl) {
-    __imgDebug.recordRevoke(currentFullResUrl);
-    URL.revokeObjectURL(currentFullResUrl);
-    currentFullResUrl = null;
-  }
-
+async function openRootFolder(dirHandle) {
   const contents = await readFolderContents(dirHandle);
-  fileObjects = contents.files;
+  currentFolderHandle = dirHandle;
   rootFileObjects = contents.files;
   subfolders = contents.folders;
-  currentFolderHandle = dirHandle;
-  currentImageFolderHandle = dirHandle;
-  currentSubfolder = null;
-
-  await renderSidebarTree();
-  resetAndLoad();
-  sidebar.classList.add("open");
-  return contents;
+  showFolderImages(dirHandle, contents.files);
+  renderSidebarTree();
+  setSidebarOpen(true);
 }
 
-async function handleSubfolderHandle(dirHandle, contents = null) {
-  if (currentFullResUrl) {
-    __imgDebug.recordRevoke(currentFullResUrl);
-    URL.revokeObjectURL(currentFullResUrl);
-    currentFullResUrl = null;
-  }
-
-  const folderContents = contents || (await readFolderContents(dirHandle));
-  fileObjects = folderContents.files;
-  currentImageFolderHandle = dirHandle;
-  resetAndLoad();
-  return folderContents;
+function reportFolderError(err) {
+  if (err && err.name === "AbortError") return; // picker cancelled
+  console.error("Cannot open folder", err);
 }
 
-function showContextMenu(e, node) {
-  e.preventDefault();
-  e.stopPropagation();
-  activeCtxNode = node;
-
-  contextMenu.style.display = "block";
-  contextMenu.style.left = e.clientX + "px";
-  contextMenu.style.top = e.clientY + "px";
-
-  // Adjust if overflow
-  const rect = contextMenu.getBoundingClientRect();
-  if (rect.right > window.innerWidth) {
-    contextMenu.style.left = e.clientX - rect.width + "px";
-  }
-  if (rect.bottom > window.innerHeight) {
-    contextMenu.style.top = e.clientY - rect.height + "px";
-  }
-}
-
-// Render tree folder trên sidebar
+/* ---------- Explorer tree ---------- */
 function createFolderToggle(name) {
   const toggle = document.createElement("button");
   toggle.type = "button";
@@ -757,93 +654,77 @@ function createFolderToggle(name) {
   return toggle;
 }
 
+function createFolderButton(name, handle) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "folder-btn";
+  btn._folderHandle = handle;
+  const span = document.createElement("span");
+  span.className = "folder-name";
+  span.textContent = name;
+  btn.appendChild(span);
+  return btn;
+}
+
 function setActiveFolderButton(button) {
-  sidebar.querySelectorAll(".folder-btn").forEach((item) => {
+  sidebar.querySelectorAll(".folder-btn.active").forEach((item) => {
     item.classList.remove("active");
   });
   button.classList.add("active");
 }
 
-async function scrollToExplorerImage(fileName) {
-  const imageIndex = fileObjects.findIndex((file) => file.name === fileName);
-  if (imageIndex < 0) return;
-
-  let item = null;
-  while (!item) {
-    item = Array.from(gallery.children).find(
-      (candidate) => candidate._file && candidate._file.name === fileName,
-    );
-    if (item) break;
-
-    if (!isInitialLoadInProgress && !isBatchLoading && currentIndex < fileObjects.length) {
-      loadMoreImages();
+async function markActiveFolder(handle) {
+  for (const btn of sidebar.querySelectorAll(".folder-btn")) {
+    if (await folderHandlesMatch(btn._folderHandle, handle)) {
+      setActiveFolderButton(btn);
+      return;
     }
-    await new Promise((resolve) => requestAnimationFrame(resolve));
   }
-
-  item.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" });
 }
 
-async function renderSidebarTree() {
-  const sidebarContent = sidebar.querySelector(".sidebar-content");
-  sidebarContent.innerHTML = "";
+function scrollToExplorerImage(fileName) {
+  const index = fileObjects.findIndex((file) => file.name === fileName);
+  if (index < 0) return;
+  gallery.children[index].scrollIntoView({
+    block: mode === "manhwa" ? "start" : "center",
+  });
+}
 
-  if (!currentFolderHandle) {
-    return;
-  }
+function renderSidebarTree() {
+  sidebarContent.replaceChildren();
+  if (!currentFolderHandle) return;
 
+  const rootName = currentFolderHandle.name || "Root Folder";
   const rootWrapper = document.createElement("div");
   rootWrapper.className = "folder-node";
 
-  const rootToggle = createFolderToggle(currentFolderHandle.name || "Root Folder");
-  const rootBtn = document.createElement("button");
-  const rootSpan = document.createElement("span");
-  rootSpan.textContent = currentFolderHandle.name || "Root Folder";
-  rootSpan.className = "folder-name";
-  rootBtn.appendChild(rootSpan);
-  rootBtn._folderHandle = currentFolderHandle;
-  rootBtn.className =
-    "folder-btn" + (currentSubfolder === null ? " active" : "");
+  const rootToggle = createFolderToggle(rootName);
+  const rootBtn = createFolderButton(rootName, currentFolderHandle);
+  if (currentImageFolderHandle === currentFolderHandle) rootBtn.classList.add("active");
 
   const rootChildren = document.createElement("div");
   rootChildren.className = "folder-tree-children";
   setFolderExpanded(rootToggle, rootChildren, true);
 
+  async function selectRoot() {
+    if (currentImageFolderHandle !== currentFolderHandle) {
+      showFolderImages(currentFolderHandle, rootFileObjects);
+    }
+    setActiveFolderButton(rootBtn);
+  }
+
   rootToggle.onclick = () => {
     const expanded = rootToggle.getAttribute("aria-expanded") !== "true";
     setFolderExpanded(rootToggle, rootChildren, expanded);
   };
-
-  rootBtn.onclick = async () => {
-    const expanded = rootToggle.getAttribute("aria-expanded") !== "true";
-    if (await folderHandlesMatch(currentImageFolderHandle, currentFolderHandle)) {
-      currentSubfolder = null;
-      setActiveFolderButton(rootBtn);
-      setFolderExpanded(rootToggle, rootChildren, expanded);
-      return;
-    }
-
-    await handleDirectoryHandle(currentFolderHandle);
-    const nextRoot = sidebar.querySelector(".sidebar-content > .folder-node");
-    setFolderExpanded(
-      nextRoot.querySelector(".folder-toggle"),
-      nextRoot.querySelector(".folder-tree-children"),
-      expanded,
-    );
-  };
-
+  rootBtn.onclick = () => selectAndToggleFolder(rootToggle, rootChildren, selectRoot);
   rootBtn.oncontextmenu = (e) =>
-    showContextMenu(e, {
-      name: currentFolderHandle.name || "Root Folder",
-      handle: currentFolderHandle,
-    });
+    showContextMenu(e, { name: rootName, handle: currentFolderHandle }, rootBtn);
 
   renderTreeNodes(subfolders, rootChildren);
   renderImageNodes(rootFileObjects, rootChildren, async (file) => {
-    if (!(await folderHandlesMatch(currentImageFolderHandle, currentFolderHandle))) {
-      await handleDirectoryHandle(currentFolderHandle);
-    }
-    await scrollToExplorerImage(file.name);
+    await selectRoot();
+    scrollToExplorerImage(file.name);
   });
 
   rootWrapper.appendChild(rootToggle);
@@ -856,15 +737,10 @@ function renderTreeNodes(nodes, container) {
   nodes.forEach((node) => {
     const wrapper = document.createElement("div");
     wrapper.className = "folder-node";
+    wrapper._node = node;
 
     const toggle = createFolderToggle(node.name);
-    const btn = document.createElement("button");
-    const span = document.createElement("span");
-    span.textContent = node.name;
-    span.className = "folder-name";
-    btn.appendChild(span);
-    btn._folderHandle = node.handle;
-    btn.className = "folder-btn";
+    const btn = createFolderButton(node.name, node.handle);
 
     const childContainer = document.createElement("div");
     childContainer.className = "folder-tree-children";
@@ -885,7 +761,7 @@ function renderTreeNodes(nodes, container) {
             renderImageNodes(result.files, childContainer, async (file) => {
               await selectFolder();
               setFolderExpanded(toggle, childContainer, true);
-              await scrollToExplorerImage(file.name);
+              scrollToExplorerImage(file.name);
             });
             loaded = true;
             return result;
@@ -903,9 +779,8 @@ function renderTreeNodes(nodes, container) {
       selectPromise = (async () => {
         const folderContents = await loadChildren();
         if (!(await folderHandlesMatch(currentImageFolderHandle, node.handle))) {
-          await handleSubfolderHandle(node.handle, folderContents);
+          showFolderImages(node.handle, folderContents.files);
         }
-        currentSubfolder = node.name;
         setActiveFolderButton(btn);
       })();
 
@@ -922,8 +797,8 @@ function renderTreeNodes(nodes, container) {
       setFolderExpanded(toggle, childContainer, expanded);
     };
     btn.onclick = () =>
-      selectAndToggleFolder(toggle, childContainer, selectFolder);
-    btn.oncontextmenu = (e) => showContextMenu(e, node);
+      selectAndToggleFolder(toggle, childContainer, selectFolder).catch(reportFolderError);
+    btn.oncontextmenu = (e) => showContextMenu(e, node, btn);
 
     wrapper.appendChild(toggle);
     wrapper.appendChild(btn);
@@ -932,29 +807,28 @@ function renderTreeNodes(nodes, container) {
   });
 }
 
-let isPicking = false; // Thêm biến cờ
+/* ---------- Opening folders ---------- */
+let isPicking = false;
 
 async function openDirectoryPicker() {
-  if (isPicking) return; // Nếu đang chọn thì không làm gì
-  isPicking = true;
-  if (window.showDirectoryPicker) {
-    try {
-      const dir = await window.showDirectoryPicker();
-      await handleDirectoryHandle(dir);
-    } catch (err) {
-      // Nếu bị hủy, không làm gì
-    }
-    isPicking = false;
-  } else {
+  if (isPicking) return;
+  if (!window.showDirectoryPicker) {
     chooseInput.click();
+    return;
+  }
+  isPicking = true;
+  try {
+    await openRootFolder(await window.showDirectoryPicker());
+  } catch (err) {
+    reportFolderError(err);
+  } finally {
     isPicking = false;
   }
 }
 
-chooseLabel.addEventListener("click", (e) => {
-  e.preventDefault(); // Ngăn hành vi mặc định
-  openDirectoryPicker();
-});
+openFolderBtn.addEventListener("click", openDirectoryPicker);
+// The whole drop zone (and its Browse button) opens the picker.
+document.getElementById("dropZone").addEventListener("click", openDirectoryPicker);
 
 /* ---------- Virtual File System for Fallbacks ---------- */
 class VirtualDirHandle {
@@ -992,13 +866,13 @@ function buildVirtualFileSystem(files) {
     if (!isImageName(f.name)) return;
     const rel = f.webkitRelativePath || f.name;
     const parts = rel.split("/");
-    
+
     // Only file name, put at root
     if (parts.length === 1) {
       rootHandle.children.set(f.name, new VirtualFileHandle(f));
       return;
     }
-    
+
     let current = rootHandle;
     for (let i = 1; i < parts.length - 1; i++) {
       const dirName = parts[i];
@@ -1014,130 +888,85 @@ function buildVirtualFileSystem(files) {
 }
 
 // fallback input handling (recursive via virtual handles)
-chooseInput.addEventListener("change", async (e) => {
-  const files = Array.from(e.target.files || []);
+chooseInput.addEventListener("change", () => {
+  const files = Array.from(chooseInput.files || []);
+  chooseInput.value = ""; // choosing the same folder again must fire "change" again
   if (files.length === 0) return;
-  
-  const rootHandle = buildVirtualFileSystem(files);
-  await handleDirectoryHandle(rootHandle);
+  openRootFolder(buildVirtualFileSystem(files)).catch(reportFolderError);
 });
 
-// Secondary folder input for drop zone button
-// Initial Browse Button (in empty state)
-const initialBrowseBtn = document.getElementById("browseFolderBtn");
-if (initialBrowseBtn) {
-  initialBrowseBtn.addEventListener("click", (e) => {
-    e.preventDefault();
-    openDirectoryPicker();
-  });
+/* ---------- Drag and Drop (anywhere in the window) ---------- */
+let dragDepth = 0;
+
+function isFileDrag(e) {
+  return Boolean(e.dataTransfer) && Array.from(e.dataTransfer.types).includes("Files");
 }
 
-/* ---------- Drag and Drop functionality ---------- */
-let dropZone = document.getElementById("dropZone");
-const emptyState = document.getElementById("emptyState");
-
-// Prevent default drag behaviors on the entire document
-["dragenter", "dragover", "dragleave", "drop"].forEach((eventName) => {
-  document.body.addEventListener(eventName, preventDefaults, false);
-});
-
-function preventDefaults(e) {
+document.addEventListener("dragenter", (e) => {
+  if (!isFileDrag(e)) return;
   e.preventDefault();
-  e.stopPropagation();
-}
-
-// Highlight drop zone when item is dragged over it
-["dragenter", "dragover"].forEach((eventName) => {
-  if (dropZone) {
-    dropZone.addEventListener(eventName, highlight, false);
-  }
+  dragDepth++;
+  document.body.classList.add("drag-over");
 });
 
-["dragleave", "drop"].forEach((eventName) => {
-  if (dropZone) {
-    dropZone.addEventListener(eventName, unhighlight, false);
-  }
+document.addEventListener("dragover", (e) => {
+  if (isFileDrag(e)) e.preventDefault(); // allow dropping files
 });
 
-function highlight(e) {
-  const target = e.currentTarget || document.getElementById("dropZone");
-  if (target) {
-    target.classList.add("drag-over");
-  }
-}
+document.addEventListener("dragleave", (e) => {
+  if (!isFileDrag(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) document.body.classList.remove("drag-over");
+});
 
-function unhighlight(e) {
-  const target = e.currentTarget || document.getElementById("dropZone");
-  if (target) {
-    target.classList.remove("drag-over");
-  }
-}
-
-// Handle dropped files
-if (dropZone) {
-  dropZone.addEventListener("drop", handleDrop, false);
-}
+document.addEventListener("drop", (e) => {
+  e.preventDefault(); // never let the browser navigate to a dropped file
+  dragDepth = 0;
+  document.body.classList.remove("drag-over");
+  handleDrop(e);
+});
 
 async function handleDrop(e) {
   const dt = e.dataTransfer;
-  const items = dt.items;
+  if (!dt) return;
+  const item = Array.from(dt.items || []).find((entry) => entry.kind === "file");
 
-  if (!items || items.length === 0) return;
-
-  // 1. Try modern File System Access API (FileSystemHandle)
-  if (items[0].getAsFileSystemHandle) {
-    try {
-      const handle = await items[0].getAsFileSystemHandle();
-      if (handle && handle.kind === "directory") {
-        await handleDirectoryHandle(handle);
-        return;
-      }
-    } catch (err) {
-      console.warn("getAsFileSystemHandle failed, falling back:", err);
-    }
-  }
-
-  // 2. Try Webkit API (FileSystemEntry)
-  if (items[0].webkitGetAsEntry) {
-    const entry = items[0].webkitGetAsEntry();
-    if (entry && entry.isDirectory) {
-      // Use FileSystem API to read directory
-      await readDirectoryEntry(entry);
-      return;
-    }
-  }
-
-  // 3. Fallback: handle as files
+  // DataTransfer is only readable during the event: take everything before awaiting.
+  const handlePromise =
+    item && item.getAsFileSystemHandle ? item.getAsFileSystemHandle() : null;
+  const entry = item && item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
   const files = Array.from(dt.files || []);
 
-  if (files.length > 0) {
-    handleDroppedFiles(files);
+  let handle = null;
+  try {
+    handle = await handlePromise;
+  } catch (err) {
+    console.warn("getAsFileSystemHandle failed, falling back:", err);
+  }
+
+  try {
+    if (handle && handle.kind === "directory") {
+      await openRootFolder(handle);
+    } else if (entry && entry.isDirectory) {
+      await openRootFolder(new FileSystemEntryDirHandle(entry));
+    } else if (files.some((file) => isImageName(file.name))) {
+      await openRootFolder(buildVirtualFileSystem(files));
+    }
+  } catch (err) {
+    reportFolderError(err);
   }
 }
 
 // Read all entries from a directory entry reader (handles batched reads)
 async function readAllEntriesFromReader(reader) {
   const entries = [];
-  let continueReading = true;
-  while (continueReading) {
-    await new Promise((resolve, reject) => {
-      reader.readEntries(
-        (results) => {
-          if (results.length === 0) {
-            continueReading = false;
-          } else {
-            entries.push(...results);
-          }
-          resolve();
-        },
-        (err) => {
-          console.error("Error reading entries", err);
-          reject(err);
-        },
-      );
+  for (;;) {
+    const results = await new Promise((resolve, reject) => {
+      reader.readEntries(resolve, reject);
     });
+    if (results.length === 0) return entries;
+    entries.push(...results);
   }
-  return entries;
 }
 
 class FileSystemEntryDirHandle {
@@ -1172,817 +1001,202 @@ class FileSystemEntryFileHandle {
   }
 }
 
-// Read directory using FileSystem API (webkit) — lazily builds tree then delegates
-async function readDirectoryEntry(dirEntry) {
-  console.log("Reading directory entry:", dirEntry.name);
-  try {
-    const virtualRoot = new FileSystemEntryDirHandle(dirEntry);
-    await handleDirectoryHandle(virtualRoot);
-  } catch (err) {
-    console.warn("Error processing directory:", err);
-  }
-}
-
-// Handle dropped files (fallback)
-function handleDroppedFiles(files) {
-  fileObjects = files.filter((f) => isImageName(f.name));
-  fileObjects.sort((a, b) => a.name.localeCompare(b.name));
-  resetAndLoad();
-  sidebar.classList.add("open");
-}
-
-/* ---------- Tab switching ---------- */
-mangaTab.addEventListener("click", () => {
-  if (mode === "manga") return;
-  mode = "manga";
-  mangaTab.classList.add("active");
-  manhwaTab.classList.remove("active");
-  mangaTab.setAttribute("aria-pressed", "true");
-  manhwaTab.setAttribute("aria-pressed", "false");
-  setSizeControlMode(mode, manhwaWidthControl, mangaSizeControl);
-
-  // reset gallery and load from start
-  resetAndLoad();
-});
-manhwaTab.addEventListener("click", () => {
-  if (mode === "manhwa") return;
-  mode = "manhwa";
-  manhwaTab.classList.add("active");
-  mangaTab.classList.remove("active");
-  manhwaTab.setAttribute("aria-pressed", "true");
-  mangaTab.setAttribute("aria-pressed", "false");
-
-  setSizeControlMode(mode, manhwaWidthControl, mangaSizeControl);
-
-  // Cập nhật lại width cho ảnh manhwa nếu đã có
-  updateManhwaImagesWidth();
-  // reset gallery and load from start
-  resetAndLoad();
-});
-
-setSizeControlMode(mode, manhwaWidthControl, mangaSizeControl);
-
-/* ---------- Thumb size control ---------- */
-thumbSizeSelect.addEventListener("change", (e) => {
-  const v = e.target.value;
-  gallery.classList.remove("layout-small", "layout-medium", "layout-large");
-  if (v === "small") gallery.classList.add("layout-small");
-  else if (v === "large") gallery.classList.add("layout-large");
-  else gallery.classList.add("layout-medium");
-  // no need to reload images; items are CSS-driven to adjust size
-});
-
-/* ---------- Reset and load ---------- */
-function resetAndLoad() {
-  // Stop any ongoing continuous loading
-  stopContinuousLoading();
-
-  if (currentRAF) {
-    cancelAnimationFrame(currentRAF);
-    currentRAF = null;
-  }
-  isBatchLoading = false;
-  isInitialLoadInProgress = false;
-
-  // Initialize virtual unload observer
-  initUnloadObserver();
-
-  // Initialize dedicated Manhwa image loader (custom, no lazysizes)
-  if (mode === "manhwa") {
-    initManhwaLoadObserver();
-  } else if (manhwaLoadObserver) {
-    manhwaLoadObserver.disconnect();
-    manhwaLoadObserver = null;
-  }
-
-  // Revoke all Object URLs to free memory
-  objectURLs.forEach((url) => {
-    __imgDebug.recordRevoke(url);
-    URL.revokeObjectURL(url);
-  });
-  objectURLs.clear();
-
-  // Also clear Manhwa decoded cache on full reset
-  clearManhwaCache();
-
-  renderedImages.clear();
-
-  gallery.innerHTML = "";
-  currentIndex = 0;
-  if (mode === "manhwa") {
-    gallery.classList.remove("gallery");
-    gallery.classList.add("manhwa-list");
-  } else {
-    gallery.classList.remove("manhwa-list");
-    gallery.classList.add("gallery");
-    if (
-      !gallery.classList.contains("layout-small") &&
-      !gallery.classList.contains("layout-medium") &&
-      !gallery.classList.contains("layout-large")
-    ) {
-      gallery.classList.add("layout-medium");
-    }
-  }
-  // Load initial batch
-  if (fileObjects.length === 0) {
-    showEmptyState();
-  } else {
-    loadInitialImages();
-  }
-}
-
-function showEmptyState() {
-  gallery.innerHTML = `
-    <div class="empty-state" id="emptyState">
-      <div class="drop-zone" id="dropZone">
-        <div class="drop-zone-content">
-          <div class="empty-icon">📂</div>
-          <h2>Drop Folder Here</h2>
-          <p>Drag and drop a folder to view your images</p>
-          <div class="drop-zone-divider">
-            <span>or</span>
-          </div>
-          <button class="drop-zone-btn" id="browseFolderBtn">
-            <span class="icon">📂</span> Browse Folder
-          </button>
-        </div>
-        <div class="drop-zone-overlay">
-          <div class="drop-zone-overlay-content">
-            <div class="drop-icon">📥</div>
-            <p>Drop folder to open</p>
-          </div>
-        </div>
-      </div>
-    </div>
-  `;
-
-  // Re-attach event listeners for dynamically created elements
-  const newDropZone = document.getElementById("dropZone");
-  const browseBtn = document.getElementById("browseFolderBtn");
-
-  if (newDropZone) {
-    // Highlight drop zone when item is dragged over it
-    ["dragenter", "dragover"].forEach((eventName) => {
-      newDropZone.addEventListener(eventName, highlight, false);
-    });
-
-    ["dragleave", "drop"].forEach((eventName) => {
-      newDropZone.addEventListener(eventName, unhighlight, false);
-    });
-
-    // Handle dropped files
-    newDropZone.addEventListener("drop", handleDrop, false);
-  }
-
-  if (browseBtn) {
-    browseBtn.addEventListener("click", (e) => {
-      e.preventDefault();
-      openDirectoryPicker();
-    });
-  }
-}
-
-/* ---------- Loading logic (batches) ---------- */
-
-// Helper: Generate thumbnail using createImageBitmap and render to Canvas
-async function renderThumbnailToCanvas(file, canvas) {
-  try {
-    // Resize to reasonable thumbnail width (e.g. 400px) to save memory
-    // This is the KEY optimization: browser decodes to a smaller bitmap
-    // Lower resolution = faster decoding + less memory = better performance
-    const bitmap = await createImageBitmap(file, { resizeWidth: 400 });
-
-    canvas.width = bitmap.width;
-    canvas.height = bitmap.height;
-
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(bitmap, 0, 0);
-
-    // Bitmap is no longer needed after drawing to canvas
-    bitmap.close();
-
-    canvas.classList.remove("skeleton-loading");
-    canvas.classList.add("loaded");
-
-    // Cache dimensions
-    if (!imageDimensionsCache.has(file.name)) {
-      imageDimensionsCache.set(file.name, {
-        width: canvas.width,
-        height: canvas.height,
-      });
-    }
-  } catch (err) {
-    console.error("Error generating thumbnail for", file.name, err);
-    canvas.classList.remove("skeleton-loading");
-    // Show error state visually if needed
-  } finally {
-    // Note: actual decode happens here via createImageBitmap
-  }
-}
-
-// Helper: Create inner element (canvas/img) attached via unload observer
-function createInnerElement(file) {
-  if (mode === "manhwa") {
-    const img = document.createElement("img");
-    img.alt = file.name;
-    img.loading = "lazy";
-    img.decoding = "async";
-    img.classList.add("skeleton-loading"); // No longer using lazysizes for Manhwa
-    // Start with a tiny placeholder (prevents broken image icon)
-    img.src = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
-    img._file = file;
-
-    // Native load handler (replaces lazyloaded event from lazysizes)
-    img.addEventListener("load", () => {
-      // Ignore the initial 1x1 placeholder load
-      if (img.src.startsWith('data:')) return;
-      img.classList.remove("skeleton-loading");
-      // Remove temporary wrapper height once loaded
-      if (img.parentElement) {
-        img.parentElement.style.height = '';
-      }
-      // Mark as loaded for potential CSS hooks
-      img.classList.add("lazyloaded");
-    });
-
-    // Error recovery: if blob URL was revoked or failed, recreate from file
-    img.addEventListener("error", () => {
-      // Only retry for blob URLs (not the initial placeholder)
-      if (!img.src || !img.src.startsWith('blob:')) return;
-      const wrapper = img.parentElement;
-      const sourceFile = wrapper && wrapper._file;
-      if (!sourceFile) return;
-
-      __imgDebug.log('Image error — retrying', sourceFile.name);
-
-      // Remove broken URL from cache and tracking
-      const brokenURL = img.src;
-      if (manhwaImageCache.has(sourceFile.name)) {
-        manhwaImageCache.delete(sourceFile.name);
-      }
-      objectURLs.delete(brokenURL);
-
-      // Create a fresh blob URL from the original file
-      const freshURL = URL.createObjectURL(sourceFile);
-      objectURLs.add(freshURL);
-      __imgDebug.recordCreate(freshURL, true);
-      cacheManhwaURL(sourceFile, freshURL);
-      img.src = freshURL;
-    });
-
-    const targetWidth = `${window.innerWidth * (maxWidthVW / 100)}px`;
-    img.style.width = targetWidth;
-    img.style.height = "auto";
-    return img;
-  } else {
-    const canvas = document.createElement("canvas");
-    canvas.classList.add("lazyload", "skeleton-loading");
-    canvas.file = file;
-
-    if (imageDimensionsCache.has(file.name)) {
-      const dims = imageDimensionsCache.get(file.name);
-      canvas.width = dims.width;
-      canvas.height = dims.height;
-    } else {
-      canvas.width = 200;
-      canvas.height = 280;
-    }
-    return canvas;
-  }
-}
-
-// Helper: Create item element (Canvas for Manga, Img for Manhwa)
-function createItemElement(file, onClick = null) {
-  const wrapper = document.createElement("div");
-  wrapper.className = mode === "manhwa" ? "manhwa-item" : "gallery-item";
-  wrapper._file = file; // Store reference for unloader
-
-  if (onClick) {
-    wrapper.addEventListener("click", onClick);
-  }
-
-  const inner = createInnerElement(file);
-  wrapper.appendChild(inner);
-
-  if (unloadObserver) {
-    unloadObserver.observe(wrapper);
-  }
-
-  // For Manhwa: also observe with dedicated load observer for controlled unveiling
-  if (mode === "manhwa" && manhwaLoadObserver) {
-    manhwaLoadObserver.observe(wrapper);
-    // Ensure items that are already intersecting (or within rootMargin) actually load.
-    // IntersectionObserver callback is not guaranteed to fire for elements that
-    // are already intersecting at the moment .observe() is called.
-    ensureManhwaImageLoaded(wrapper);
-  }
-
-  renderedImages.add(wrapper);
-  return wrapper;
-}
-
-// Lazysizes hook for canvas AND deferred Object URL creation for img
-document.addEventListener("lazybeforeunveil", function (e) {
-  var target = e.target;
-  if (target.tagName === "CANVAS" && target.file) {
-    renderThumbnailToCanvas(target.file, target);
-  } else if (target.tagName === "IMG" && target._file) {
-    // Create Object URL just-in-time when lazysizes is about to unveil
-    var url = URL.createObjectURL(target._file);
-    objectURLs.add(url);
-    __imgDebug.recordCreate(url, true); // Manhwa full-res image
-    target.dataset.src = url;
-    target._file = null; // Release File reference
-  }
-});
-
-// Load initial batch of images when screen initializes
-// Progressive loading in small chunks to prevent UI freeze
-function loadInitialImages() {
-  if (fileObjects.length === 0) return;
-
-  isInitialLoadInProgress = true;
-  const CHUNK_SIZE = 5; // Small chunks for responsive UI
-  const initialCount = Math.min(BATCH_SIZE, fileObjects.length);
-  let chunkStart = 0;
-
-  function finishInitialLoad() {
-    currentIndex = initialCount;
-    currentRAF = null;
-    isInitialLoadInProgress = false;
-    if (currentIndex < fileObjects.length) {
-      startContinuousLoading();
-    }
-  }
-
-  function loadChunk() {
-    const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, initialCount);
-
-    if (chunkStart >= initialCount) {
-      finishInitialLoad();
-      return;
-    }
-
-    const fragment = document.createDocumentFragment();
-    for (let i = chunkStart; i < chunkEnd; i++) {
-      const file = fileObjects[i];
-      if (!file) continue; // Defensive check
-      const item = createItemElement(file, () => openModalWithItem(file));
-      fragment.appendChild(item);
-    }
-
-    gallery.appendChild(fragment);
-    chunkStart = chunkEnd;
-
-    if (chunkStart < initialCount) {
-      currentRAF = requestAnimationFrame(loadChunk);
-    } else {
-      finishInitialLoad();
-    }
-  }
-
-  currentRAF = requestAnimationFrame(loadChunk);
-}
-
-// Load more images for infinite scroll
-// Use chunked loading for smooth scrolling
-function loadMoreImages() {
-  if (isBatchLoading || currentIndex >= fileObjects.length) return;
-  isBatchLoading = true;
-
-  const batchEnd = Math.min(currentIndex + BATCH_SIZE, fileObjects.length);
-  const CHUNK_SIZE = 5;
-  let chunkStart = currentIndex;
-
-  function loadChunk() {
-    const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, batchEnd);
-
-    if (chunkStart >= batchEnd) {
-      currentIndex = batchEnd;
-      isBatchLoading = false;
-      return;
-    }
-
-    const fragment = document.createDocumentFragment();
-    for (let i = chunkStart; i < chunkEnd; i++) {
-      const file = fileObjects[i];
-      if (!file) continue; // Defensive check
-      const item = createItemElement(file, () => openModalWithItem(file));
-      fragment.appendChild(item);
-    }
-
-    gallery.appendChild(fragment);
-    chunkStart = chunkEnd;
-
-    if (chunkStart < batchEnd) {
-      currentRAF = requestAnimationFrame(loadChunk);
-    } else {
-      currentIndex = batchEnd;
-      isBatchLoading = false;
-    }
-  }
-
-  currentRAF = requestAnimationFrame(loadChunk);
-}
-
-/* Time-based auto-loading + scroll-triggered loading */
-let sentinelObserver = null;
-let autoLoadTimer = null;
-const AUTO_LOAD_INTERVAL = 500; // ms between auto-load batches
-
-function startContinuousLoading() {
-  // Stop any existing loaders
-  stopContinuousLoading();
-
-  // 1. Time-based auto-loading: load batches at intervals regardless of scroll
-  autoLoadTimer = setInterval(() => {
-    if (!isBatchLoading && currentIndex < fileObjects.length) {
-      loadMoreImages();
-    }
-    // Stop timer when all images are loaded
-    if (currentIndex >= fileObjects.length) {
-      clearInterval(autoLoadTimer);
-      autoLoadTimer = null;
-    }
-  }, AUTO_LOAD_INTERVAL);
-
-  // 2. Scroll-triggered loading: also load immediately when user scrolls near bottom
-  const sentinel = document.getElementById("sentinel");
-  if (!sentinel) return;
-
-  sentinelObserver = new IntersectionObserver(
-    (entries) => {
-      if (entries[0].isIntersecting && !isBatchLoading && currentIndex < fileObjects.length) {
-        loadMoreImages();
-      }
-    },
-    {
-      root: document.getElementById("mainBody"),
-      rootMargin: "600px",
-    },
-  );
-  sentinelObserver.observe(sentinel);
-}
-
-function stopContinuousLoading() {
-  if (autoLoadTimer) {
-    clearInterval(autoLoadTimer);
-    autoLoadTimer = null;
-  }
-  if (sentinelObserver) {
-    sentinelObserver.disconnect();
-    sentinelObserver = null;
-  }
-  // Note: Do NOT touch manhwaLoadObserver here.
-  // It is managed exclusively in resetAndLoad() / initManhwaLoadObserver().
-  // Killing it here broke loading for images added via continuous loading.
-}
-
 /* ---------- Clear ---------- */
 clearBtn.addEventListener("click", () => {
-  // Stop continuous loading
-  stopContinuousLoading();
-
-  if (currentFullResUrl) {
-    __imgDebug.recordRevoke(currentFullResUrl);
-    URL.revokeObjectURL(currentFullResUrl);
-    currentFullResUrl = null;
-  }
-  fileObjects = [];
-
-  // Reset folder state
+  if (modal.open) modal.close();
   currentFolderHandle = null;
-  currentSubfolder = null;
-  currentImageFolderHandle = null;
   rootFileObjects = [];
-
-  // Clear sidebar
+  subfolders = [];
+  showFolderImages(null, []);
   renderSidebarTree();
-
-  gallery.innerHTML = "";
-  currentIndex = 0;
-
-  clearManhwaCache();
-  showEmptyState();
 });
 
 /* ---------- Modal logic (Manga only) ---------- */
+let currentModalIndex = -1;
+let view = { scale: 1, x: 0, y: 0 }; // see modal-zoom.js
+let baseWidth = 0; // fitted image size before zoom
+let baseHeight = 0;
 
-function openModalWithItem(file) {
-  if (mode !== "manga") return;
-
-  // Find index
-  currentModalIndex = fileObjects.indexOf(file);
-  if (currentModalIndex === -1) currentModalIndex = 0;
-
-  loadModalImage(file);
-
-  modal.classList.add("active");
-  modal.setAttribute("aria-hidden", "false");
+function openModal(index) {
+  if (mode !== "manga" || !fileObjects[index]) return;
+  currentModalIndex = index;
+  showModalImage();
+  if (!modal.open) modal.showModal();
 }
 
-function loadModalImage(file) {
-  // Revoke previous URL to save memory
-  if (currentFullResUrl) {
-    __imgDebug.recordRevoke(currentFullResUrl);
-    URL.revokeObjectURL(currentFullResUrl);
+function showModalImage() {
+  const file = fileObjects[currentModalIndex];
+  const url = getObjectURL(file);
+  modalImage.alt = file.name;
+  modalImage.src = url;
+  resetView();
+  modalImage.decode().then(
+    () => {
+      if (modalImage.src === url) fitImageToView();
+    },
+    () => {}, // broken image: alt text is shown
+  );
+}
+
+function navigateModal(delta) {
+  if (fileObjects.length === 0) return;
+  currentModalIndex =
+    (currentModalIndex + delta + fileObjects.length) % fileObjects.length;
+  showModalImage();
+}
+
+function closeModal() {
+  modal.close();
+}
+
+// Esc (native <dialog>) and the close button both end here
+modal.addEventListener("close", () => {
+  pointers.clear();
+  resetView();
+});
+
+function fitImageToView() {
+  const aspect = (modalImage.naturalHeight || 1) / (modalImage.naturalWidth || 1);
+  baseWidth = window.innerWidth * 0.85;
+  baseHeight = baseWidth * aspect;
+  const maxHeight = window.innerHeight * 0.85;
+  if (baseHeight > maxHeight) {
+    baseHeight = maxHeight;
+    baseWidth = baseHeight / aspect;
   }
-
-  resetZoomState();
-
-  // Create new URL for full res
-  currentFullResUrl = URL.createObjectURL(file);
-  __imgDebug.recordCreate(currentFullResUrl, false); // Modal full-res
-  modalImage.src = currentFullResUrl;
-
-  modalImage.onload = () => {
-    fitImageToView();
-  };
+  modalImage.style.width = `${baseWidth}px`;
+  modalImage.style.height = `${baseHeight}px`;
+  resetView();
 }
 
-function updateManhwaImagesWidth() {
-  const items = document.querySelectorAll(".manhwa-item img");
-  const vw = window.innerWidth * (maxWidthVW / 100);
-  items.forEach((img) => {
-    img.style.width = `${vw}px`;
-    img.style.height = "auto"; // giữ tỉ lệ
-  });
-}
-
-function syncManhwaWidthControl() {
-  manhwaWidthValue.textContent = `${maxWidthVW}%`;
-  decreaseManhwaWidth.disabled = maxWidthVW === 10;
-  increaseManhwaWidth.disabled = maxWidthVW === 100;
-}
-
-function changeManhwaWidth(direction) {
-  maxWidthVW = stepManhwaWidth(maxWidthVW, direction);
-  syncManhwaWidthControl();
-  if (mode === "manhwa") updateManhwaImagesWidth();
-}
-
-decreaseManhwaWidth.addEventListener("click", () => changeManhwaWidth(-1));
-increaseManhwaWidth.addEventListener("click", () => changeManhwaWidth(1));
-syncManhwaWidthControl();
-
-function resetZoomState() {
-  zoomed = false;
-  scale = 1;
-  translateX = 0;
-  translateY = 0;
-  originX = 50;
-  originY = 50;
-  modalImage.style.transition = "transform 0.1s linear";
-  modalImage.style.transformOrigin = "50% 50%";
-  modalImage.style.transform = "translate(0px, 0px) scale(1)";
-  modalImage.style.cursor = "zoom-in";
+function resetView() {
+  view = { scale: 1, x: 0, y: 0 };
+  renderView(true);
   hideZoomIndicator();
 }
 
-function fitImageToView() {
-  if (!modalImage) return;
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
-  const imgW = modalImage.naturalWidth || 1;
-  const imgH = modalImage.naturalHeight || 1;
-  const aspect = imgH / imgW;
-
-  let displayW = vw * 0.85;
-  let displayH = displayW * aspect;
-  const maxH = vh * 0.85;
-  if (displayH > maxH) {
-    displayH = maxH;
-    displayW = displayH / aspect;
-  }
-
-  modalImage.style.width = `${displayW}px`;
-  modalImage.style.height = `${displayH}px`;
-  modalImage.style.objectFit = "contain";
-  resetZoomState();
+function renderView(animate = false) {
+  view = clampPan(view, baseWidth, baseHeight, imageWrapper.clientWidth, imageWrapper.clientHeight);
+  modalImage.style.transition = animate ? "transform 0.15s ease-out" : "none";
+  modalImage.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;
+  imageWrapper.classList.toggle("is-zoomed", view.scale > 1.01);
 }
 
-function clampPan() {
-  if (!modalImage) return;
-  const rect = modalImage.getBoundingClientRect();
-  const container = modalImage.parentElement;
-  if (!container) return;
-  const cRect = container.getBoundingClientRect();
-  const imgW = rect.width;
-  const imgH = rect.height;
-  const contW = cRect.width;
-  const contH = cRect.height;
-  const maxX = Math.max(0, (imgW - contW) / 2);
-  const maxY = Math.max(0, (imgH - contH) / 2);
-  translateX = Math.max(-maxX, Math.min(maxX, translateX));
-  translateY = Math.max(-maxY, Math.min(maxY, translateY));
-  modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
+// Zoom keeping the point under (clientX, clientY) fixed; null = viewer centre.
+function zoomTo(scale, clientX = null, clientY = null, animate = false) {
+  const nextScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, scale));
+  if (nextScale === view.scale) return;
+  const rect = imageWrapper.getBoundingClientRect();
+  const centerX = rect.left + rect.width / 2;
+  const centerY = rect.top + rect.height / 2;
+  view = zoomAt(
+    view,
+    nextScale,
+    (clientX === null ? centerX : clientX) - centerX,
+    (clientY === null ? centerY : clientY) - centerY,
+  );
+  renderView(animate);
+  showZoomIndicator(Math.round(view.scale * 100));
 }
 
-function zoomTo(target, clientX = null, clientY = null, animate = false) {
-  const rect = modalImage.getBoundingClientRect();
-  const imgW = rect.width;
-  const imgH = rect.height;
+closeModalBtn.addEventListener("click", closeModal);
 
-  // Current visual center in image space (accounting for current transform)
-  const prevScale = scale;
-
-  let newScale;
-  if (target > 0) {
-    newScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, target));
-  } else {
-    // relative zoom (target is negative multiplier like -1.15)
-    newScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, prevScale * Math.abs(target)));
-  }
-
-  if (newScale === prevScale) return;
-
-  // Determine pivot point in client coordinates
-  let pivotClientX = clientX;
-  let pivotClientY = clientY;
-  if (pivotClientX == null || pivotClientY == null) {
-    // default to center of image
-    pivotClientX = rect.left + imgW / 2;
-    pivotClientY = rect.top + imgH / 2;
-  }
-
-  // Convert pivot to image-relative percentages (before new scale)
-  const offsetX = pivotClientX - rect.left;
-  const offsetY = pivotClientY - rect.top;
-
-  // How much the point moves due to scale change
-  const scaleRatio = newScale / prevScale;
-
-  // New translate so that the point under the cursor stays under the cursor
-  translateX = (translateX + offsetX) * scaleRatio - offsetX;
-  translateY = (translateY + offsetY) * scaleRatio - offsetY;
-
-  scale = newScale;
-  zoomed = scale > 1.001;
-
-  // Update origin for visual correctness (we still use translate+scale, origin stays center)
-  modalImage.style.transformOrigin = "50% 50%";
-
-  if (animate) {
-    modalImage.style.transition = "transform 0.15s cubic-bezier(0.25, 0.1, 0.25, 1)";
-  } else {
-    modalImage.style.transition = "none";
-  }
-
-  modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
-  modalImage.style.cursor = zoomed ? "grab" : "zoom-in";
-
-  showZoomIndicator(Math.round(scale * 100));
-  clampPan();
-
-  if (animate) {
-    setTimeout(() => {
-      if (modalImage) modalImage.style.transition = "none";
-    }, 160);
-  }
-}
-
-// click outside to close
-modal.addEventListener("click", (e) => {
-  if (e.target === modal || e.target.classList.contains("modal-backdrop"))
-    closeModal();
-});
-if (closeModalBtn) {
-  closeModalBtn.addEventListener("click", closeModal);
-}
-function closeModal() {
-  modal.classList.remove("active");
-  modal.setAttribute("aria-hidden", "true");
-  resetZoomState();
-  // Optionally revoke URL here too if we want to clear memory immediately
-  // But keeping it might be faster if user re-opens same image?
-  // Let's keep it until next navigation or clear.
-}
-
-// Double-click: toggle between fit (reset) and 100% natural size at click point
+// Double-click: toggle between fit and a closer look at the click point
 modalImage.addEventListener("dblclick", (e) => {
   e.preventDefault();
-  if (scale > 1.05) {
+  if (view.scale > 1.05) {
     fitImageToView();
   } else {
-    zoomTo(scale * ZOOM_DBLCLICK_FACTOR, e.clientX, e.clientY, true);
+    zoomTo(view.scale * ZOOM_DBLCLICK_FACTOR, e.clientX, e.clientY, true);
   }
 });
 
-// Wheel = zoom (cursor-centered). Always active. Shift not needed anymore.
-modalImage.addEventListener(
+// Wheel = zoom at the cursor, anywhere in the viewer
+imageWrapper.addEventListener(
   "wheel",
   (e) => {
     e.preventDefault();
-
-    // Use exponential zoom for natural feel (like Photoshop / Viewer.js)
-    const delta = -e.deltaY; // positive = zoom in
-    const factor = Math.exp(delta * ZOOM_WHEEL_FACTOR);
-    zoomTo(scale * factor, e.clientX, e.clientY, false);
+    zoomTo(view.scale * Math.exp(-e.deltaY * ZOOM_WHEEL_FACTOR), e.clientX, e.clientY);
   },
   { passive: false },
 );
 
-// zoom buttons — now use central helper with smooth animation
-zoomInBtn.addEventListener("click", () => {
-  zoomTo(scale * ZOOM_BUTTON_FACTOR, null, null, true);
-});
-zoomOutBtn.addEventListener("click", () => {
-  zoomTo(scale / ZOOM_BUTTON_FACTOR, null, null, true);
-});
-resetZoomBtn.addEventListener("click", () => {
-  fitImageToView();
-});
+zoomInBtn.addEventListener("click", () => zoomTo(view.scale * ZOOM_BUTTON_FACTOR, null, null, true));
+zoomOutBtn.addEventListener("click", () => zoomTo(view.scale / ZOOM_BUTTON_FACTOR, null, null, true));
+resetZoomBtn.addEventListener("click", fitImageToView);
 
-// Drag to pan (works whenever we are zoomed beyond fit)
-modalImage.addEventListener("mousedown", (e) => {
-  if (scale <= 1.01) return; // only pan when actually zoomed
-  e.preventDefault();
-  isDragging = true;
-  dragStartX = e.clientX - translateX;
-  dragStartY = e.clientY - translateY;
-  modalImage.style.cursor = "grabbing";
+/* Pan (one pointer, when zoomed) and pinch (two pointers): mouse, pen and touch alike */
+const pointers = new Map(); // pointerId -> {x, y}
+let pinchDistance = 0;
+let dragStart = null;
+let dragMoved = false;
 
-  window.addEventListener("mousemove", onMouseMove, { passive: true });
-  window.addEventListener("mouseup", onMouseUp);
-});
-
-function onMouseMove(e) {
-  if (!isDragging) return;
-  translateX = e.clientX - dragStartX;
-  translateY = e.clientY - dragStartY;
-  modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
-  clampPan();
-}
-
-function onMouseUp() {
-  isDragging = false;
-  modalImage.style.cursor = scale > 1.01 ? "grab" : "zoom-in";
-  window.removeEventListener("mousemove", onMouseMove);
-  window.removeEventListener("mouseup", onMouseUp);
-}
-
-/* ========== Pinch-to-zoom (touch + pointer unified) ========== */
-let pointers = new Map();
-
-function getPinchDistance() {
-  const pts = Array.from(pointers.values());
-  if (pts.length < 2) return 0;
-  const dx = pts[0].x - pts[1].x;
-  const dy = pts[0].y - pts[1].y;
-  return Math.hypot(dx, dy);
-}
-
-function getPinchCenter() {
-  const pts = Array.from(pointers.values());
-  if (pts.length < 2) return null;
-  return {
-    x: (pts[0].x + pts[1].x) / 2,
-    y: (pts[0].y + pts[1].y) / 2,
-  };
-}
-
-modalImage.addEventListener("pointerdown", (e) => {
+imageWrapper.addEventListener("pointerdown", (e) => {
+  if (e.pointerType === "mouse" && e.button !== 0) return;
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
-  if (pointers.size === 2) {
-    // entering pinch
-    modalImage.setPointerCapture(e.pointerId);
+  pinchDistance = 0;
+  dragStart = { x: e.clientX, y: e.clientY };
+  dragMoved = false;
+});
+
+imageWrapper.addEventListener("pointermove", (e) => {
+  const last = pointers.get(e.pointerId);
+  if (!last) return;
+  const point = { x: e.clientX, y: e.clientY };
+  pointers.set(e.pointerId, point);
+  if (!dragMoved && Math.hypot(point.x - dragStart.x, point.y - dragStart.y) > 4) {
+    dragMoved = true;
+    imageWrapper.setPointerCapture(e.pointerId);
   }
-});
-
-modalImage.addEventListener("pointermove", (e) => {
-  if (!pointers.has(e.pointerId)) return;
-  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
   if (pointers.size === 2) {
-    const dist = getPinchDistance();
-    if (!modalImage._lastPinchDist) {
-      modalImage._lastPinchDist = dist;
-      return;
+    const [a, b] = pointers.values();
+    const distance = Math.hypot(a.x - b.x, a.y - b.y);
+    if (pinchDistance) {
+      zoomTo(view.scale * (distance / pinchDistance), (a.x + b.x) / 2, (a.y + b.y) / 2);
     }
-    const center = getPinchCenter();
-    const ratio = dist / modalImage._lastPinchDist;
-    modalImage._lastPinchDist = dist;
-
-    // Apply relative zoom toward pinch center
-    zoomTo(scale * ratio, center.x, center.y, false);
+    pinchDistance = distance;
+  } else if (dragMoved && view.scale > 1.01) {
+    imageWrapper.classList.add("is-panning");
+    view = { ...view, x: view.x + point.x - last.x, y: view.y + point.y - last.y };
+    renderView();
   }
 });
 
 function endPointer(e) {
   pointers.delete(e.pointerId);
-  modalImage._lastPinchDist = 0;
-  if (pointers.size < 2) {
-    // back to single pointer or none — let normal drag take over if needed
-  }
+  pinchDistance = 0;
+  if (pointers.size === 0) imageWrapper.classList.remove("is-panning");
 }
-modalImage.addEventListener("pointerup", endPointer);
-modalImage.addEventListener("pointercancel", endPointer);
-modalImage.addEventListener("pointerleave", endPointer);
+imageWrapper.addEventListener("pointerup", endPointer);
+imageWrapper.addEventListener("pointercancel", endPointer);
+
+// Click on the empty area around the image closes the viewer (not after a drag).
+imageWrapper.addEventListener("click", (e) => {
+  if (e.target === imageWrapper && !dragMoved) closeModal();
+});
 
 // prev/next buttons
 prevBtn.addEventListener("click", () => navigateModal(-1));
 nextBtn.addEventListener("click", () => navigateModal(1));
 
+/* Zoom indicator helpers */
+let zoomIndicatorTimeout = null;
+
+function showZoomIndicator(percent) {
+  zoomIndicator.textContent = `${percent}%`;
+  zoomIndicator.classList.add("visible");
+  clearTimeout(zoomIndicatorTimeout);
+  zoomIndicatorTimeout = setTimeout(hideZoomIndicator, 8000);
+}
+
+function hideZoomIndicator() {
+  zoomIndicator.classList.remove("visible");
+}
+
+zoomIndicator.addEventListener("click", fitImageToView);
+
+/* ---------- Keyboard ---------- */
 let arrowScrollVelocity = 0;
 let arrowScrollRAF = null;
 const ARROW_SCROLL_SPEED = 30; // Pixels per frame for continuous scroll
@@ -1996,94 +1210,61 @@ function arrowContinuousScroll() {
   }
 }
 
-/* Zoom indicator helpers */
-let zoomIndicatorTimeout = null;
-const zoomIndicator = document.getElementById("zoomIndicator");
-
-function showZoomIndicator(percent) {
-  if (!zoomIndicator) return;
-  zoomIndicator.textContent = `${percent}%`;
-  zoomIndicator.classList.add("visible");
-  zoomIndicator.setAttribute("aria-hidden", "false");
-
-  clearTimeout(zoomIndicatorTimeout);
-  zoomIndicatorTimeout = setTimeout(() => {
-    hideZoomIndicator();
-  }, 8000);
-}
-
-if (zoomIndicator) {
-  zoomIndicator.style.pointerEvents = "auto";
-  zoomIndicator.style.cursor = "pointer";
-  zoomIndicator.addEventListener("click", () => {
+function handleModalKey(e) {
+  if (e.key === "ArrowRight") navigateModal(1);
+  else if (e.key === "ArrowLeft") navigateModal(-1);
+  else if (e.key === "+" || e.key === "=") {
+    e.preventDefault();
+    zoomTo(view.scale * ZOOM_KEYBOARD_STEP, null, null, true);
+  } else if (e.key === "-") {
+    e.preventDefault();
+    zoomTo(view.scale / ZOOM_KEYBOARD_STEP, null, null, true);
+  } else if (e.key === "0" || e.key === "r" || e.key === "R") {
+    e.preventDefault();
     fitImageToView();
-  });
-}
-
-function hideZoomIndicator() {
-  if (!zoomIndicator) return;
-  zoomIndicator.classList.remove("visible");
-  zoomIndicator.setAttribute("aria-hidden", "true");
+  } else if (e.key === "1") {
+    e.preventDefault();
+    zoomTo((modalImage.naturalWidth || baseWidth) / baseWidth, null, null, true);
+  } else if ((e.key === "ArrowUp" || e.key === "ArrowDown") && view.scale > 1.05) {
+    // Pan vertically with arrows when zoomed
+    e.preventDefault();
+    view = { ...view, y: view.y + (e.key === "ArrowUp" ? 80 : -80) };
+    renderView(true);
+  }
 }
 
 window.addEventListener("keydown", (e) => {
+  if (e.altKey || e.ctrlKey || e.metaKey) return; // keep browser shortcuts (Alt+← = back)
   // Skip if focused on input elements
-  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.target.tagName === "TEXTAREA") return;
+  if (["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName)) return;
 
-  if (modal.classList.contains("active")) {
-    // Modal navigation + zoom
-    if (e.key === "ArrowRight") navigateModal(1);
-    else if (e.key === "ArrowLeft") navigateModal(-1);
-    else if (e.key === "Escape") closeModal();
-    else if (e.key === "+" || e.key === "=") {
-      e.preventDefault();
-      zoomTo(scale * ZOOM_KEYBOARD_STEP, null, null, true);
-    } else if (e.key === "-") {
-      e.preventDefault();
-      zoomTo(scale / ZOOM_KEYBOARD_STEP, null, null, true);
-    } else if (e.key === "0") {
-      e.preventDefault();
-      fitImageToView();
-    } else if (e.key === "1") {
-      e.preventDefault();
-      const rect = modalImage.getBoundingClientRect();
-      const target = (modalImage.naturalWidth || rect.width) / rect.width;
-      zoomTo(Math.min(ZOOM_MAX, target), null, null, true);
-    } else if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key) && scale > 1.05) {
-      // Pan with arrows when zoomed
-      e.preventDefault();
-      const panStep = 80;
-      if (e.key === "ArrowUp") translateY += panStep;
-      if (e.key === "ArrowDown") translateY -= panStep;
-      if (e.key === "ArrowLeft") translateX += panStep;
-      if (e.key === "ArrowRight") translateX -= panStep;
-      modalImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
-      clampPan();
+  if (modal.open) {
+    handleModalKey(e); // Esc is handled natively by <dialog>
+    return;
+  }
+
+  if (e.key === "Escape") {
+    if (!contextMenu.hidden) {
+      hideContextMenu();
+      if (activeCtxNode) activeCtxNode.button.focus();
+    } else if (!sidebar.classList.contains("pinned")) {
+      setSidebarOpen(false);
     }
-  } else {
+  } else if (e.key === "ArrowLeft") {
     // Folder navigation (when modal is not open)
-    if (e.key === "ArrowLeft") {
-      e.preventDefault();
-      navigateToSiblingFolder(-1);
-    } else if (e.key === "ArrowRight") {
-      e.preventDefault();
-      navigateToSiblingFolder(1);
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      if (e.repeat) {
-        arrowScrollVelocity = -ARROW_SCROLL_SPEED;
-        if (!arrowScrollRAF) arrowContinuousScroll();
-      } else {
-        mainBody.scrollBy({ top: -400, behavior: "smooth" });
-      }
-    } else if (e.key === "ArrowDown") {
-      e.preventDefault();
-      if (e.repeat) {
-        arrowScrollVelocity = ARROW_SCROLL_SPEED;
-        if (!arrowScrollRAF) arrowContinuousScroll();
-      } else {
-        mainBody.scrollBy({ top: 400, behavior: "smooth" });
-      }
+    e.preventDefault();
+    navigateToSiblingFolder(-1);
+  } else if (e.key === "ArrowRight") {
+    e.preventDefault();
+    navigateToSiblingFolder(1);
+  } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    e.preventDefault();
+    const direction = e.key === "ArrowUp" ? -1 : 1;
+    if (e.repeat) {
+      arrowScrollVelocity = direction * ARROW_SCROLL_SPEED;
+      if (!arrowScrollRAF) arrowContinuousScroll();
+    } else {
+      mainBody.scrollBy({ top: direction * 400, behavior: "smooth" });
     }
   }
 });
@@ -2122,19 +1303,15 @@ async function navigateToSiblingFolder(direction) {
     if (!container || container.classList.contains("sidebar-content")) break;
 
     // Get all sibling folder-node elements at this level
-    const siblings = Array.from(
-      container.querySelectorAll(":scope > .folder-node"),
-    );
-    const currentIndex = siblings.indexOf(folderNode);
+    const siblings = Array.from(container.querySelectorAll(":scope > .folder-node"));
+    const index = siblings.indexOf(folderNode);
 
     // Search siblings in the given direction
-    let nextIndex = currentIndex + direction;
+    let nextIndex = index + direction;
     while (nextIndex >= 0 && nextIndex < siblings.length) {
-      const candidateNode = siblings[nextIndex];
-      const candidateBtn = candidateNode.querySelector(":scope > .folder-btn");
+      const candidateBtn = siblings[nextIndex].querySelector(":scope > .folder-btn");
       if (candidateBtn && candidateBtn._folderHandle) {
-        const hasImages = await folderHasImages(candidateBtn._folderHandle);
-        if (hasImages) {
+        if (await folderHasImages(candidateBtn._folderHandle)) {
           candidateBtn.click();
           return;
         }
@@ -2147,134 +1324,57 @@ async function navigateToSiblingFolder(direction) {
   }
 }
 
-function navigateModal(delta) {
-  if (fileObjects.length === 0) return;
-  currentModalIndex =
-    (currentModalIndex + delta + fileObjects.length) % fileObjects.length;
-
-  loadModalImage(fileObjects[currentModalIndex]);
-}
-
-/* ---------- Resize handling: when viewport changes while modal open, refit if not zoomed ---------- */
+/* ---------- Resize: refit the viewer if not zoomed, otherwise keep the pan in bounds ---------- */
 let resizeTimeout;
 window.addEventListener("resize", () => {
-  if (modal.classList.contains("active") && !zoomed) {
-    clearTimeout(resizeTimeout);
-    resizeTimeout = setTimeout(() => {
-      fitImageToView();
-    }, 100);
-  }
+  if (!modal.open) return;
+  clearTimeout(resizeTimeout);
+  resizeTimeout = setTimeout(() => {
+    if (view.scale > 1.001) renderView();
+    else fitImageToView();
+  }, 100);
 });
 
-/* ---------- helper to build initial state ---------- */
-// ensure initial classes
-gallery.classList.add("gallery", "layout-medium");
-
-/* ---------- hide header when scroll down ---------- */
-let lastScrollY = mainBody.scrollTop;
-let header = document.querySelector(".header");
-let ticking = false;
+/* ---------- Scroll performance ---------- */
 let scrollTimeout;
 
-function handleScroll() {
-  // Performance: Add is-scrolling class to disable hover effects
+// Add is-scrolling to drop hover effects and backdrop blur while scrolling.
+function markScrolling() {
   document.body.classList.add("is-scrolling");
   clearTimeout(scrollTimeout);
   scrollTimeout = setTimeout(() => {
     document.body.classList.remove("is-scrolling");
   }, 150);
-
-  lastScrollY = mainBody.scrollTop;
-  ticking = false;
 }
 
-function requestScrollTick(e) {
-  if (!ticking) {
-    window.requestAnimationFrame(handleScroll);
-    ticking = true;
-  }
-}
-
-mainBody.addEventListener("scroll", requestScrollTick, { passive: true });
-
-// Pre-activate scroll optimizations on wheel event BEFORE the scroll actually fires.
-// This prevents the first-frame stutter after idle because:
-// 1. backdrop-filter is disabled before the scroll layout/paint
-// 2. pointer-events are disabled before hover recalc
-// The wheel event fires before the scroll event, giving us a head start.
-mainBody.addEventListener("wheel", () => {
-  if (!document.body.classList.contains("is-scrolling")) {
-    document.body.classList.add("is-scrolling");
-  }
-  clearTimeout(scrollTimeout);
-  scrollTimeout = setTimeout(() => {
-    document.body.classList.remove("is-scrolling");
-  }, 150);
-}, { passive: true });
+mainBody.addEventListener("scroll", markScrolling, { passive: true });
+// Pre-activate scroll optimizations on wheel, which fires BEFORE the scroll:
+// avoids the first-frame stutter after idle (blur/hover off before the first paint).
+mainBody.addEventListener("wheel", markScrolling, { passive: true });
 
 // Scroll buttons
 const scrollTopBtn = document.getElementById("scrollTopBtn");
 const scrollBottomBtn = document.getElementById("scrollBottomBtn");
 const scrollButtonsContainer = document.querySelector(".scroll-buttons");
 
-// Check if page has vertical scrollbar and toggle button visibility
 function updateScrollButtonsVisibility() {
-  const hasScroll = mainBody.scrollHeight > mainBody.clientHeight;
-  if (hasScroll) {
-    scrollButtonsContainer.classList.add("visible");
-  } else {
-    scrollButtonsContainer.classList.remove("visible");
-  }
+  const hasScroll = mainBody.scrollHeight > mainBody.clientHeight + 1;
+  scrollButtonsContainer.classList.toggle("visible", hasScroll);
 }
 
-// Check on load, resize, and when content changes
-updateScrollButtonsVisibility();
-window.addEventListener("resize", updateScrollButtonsVisibility);
+// Fires after layout when content or viewport size changes (no forced reflow).
+const scrollSizeObserver = new ResizeObserver(updateScrollButtonsVisibility);
+scrollSizeObserver.observe(mainBody);
+scrollSizeObserver.observe(gallery);
 
-// Create a MutationObserver to watch for content changes in gallery
-const galleryObserver = new MutationObserver(updateScrollButtonsVisibility);
-galleryObserver.observe(gallery, { childList: true, subtree: true });
-
-scrollTopBtn.addEventListener("click", () => {
-  mainBody.scrollTo({ top: 0, behavior: "smooth" });
-});
-scrollBottomBtn.addEventListener("click", () => {
-  mainBody.scrollTo({ top: mainBody.scrollHeight, behavior: "smooth" });
-});
-
-const sidebarPin = document.getElementById("sidebarPin");
-let sidebarPinned = false;
-
-// Load pinned state from localStorage
-const savedPinState = localStorage.getItem("sidebarPinned");
-if (savedPinState === "true") {
-  sidebarPinned = true;
-  sidebar.classList.add("pinned");
-  sidebarPin.classList.add("pinned");
-  sidebarPin.title = "Unpin Sidebar";
-  document.body.classList.add("sidebar-pinned");
+function scrollMainTo(top) {
+  // Smooth-scrolling across a long chapter would start decoding every page on the way.
+  const far = Math.abs(top - mainBody.scrollTop) > 3 * mainBody.clientHeight;
+  mainBody.scrollTo({ top, behavior: far ? "auto" : "smooth" });
 }
 
-sidebarPin.addEventListener("click", () => {
-  sidebarPinned = !sidebarPinned;
-
-  if (sidebarPinned) {
-    sidebar.classList.add("pinned");
-    sidebarPin.classList.add("pinned");
-    sidebarPin.title = "Unpin Sidebar";
-  } else {
-    sidebar.classList.remove("pinned");
-    sidebarPin.classList.remove("pinned");
-    sidebarPin.title = "Pin Sidebar";
-  }
-
-  document.body.classList.toggle("sidebar-pinned", sidebarPinned);
-  localStorage.setItem("sidebarPinned", sidebarPinned);
-});
-
+scrollTopBtn.addEventListener("click", () => scrollMainTo(0));
+scrollBottomBtn.addEventListener("click", () => scrollMainTo(mainBody.scrollHeight));
 
 // Set current year in footer
-const yearSpan = document.getElementById("copyrightYear");
-if (yearSpan) {
-  yearSpan.textContent = new Date().getFullYear();
-}
+document.getElementById("copyrightYear").textContent = new Date().getFullYear();
