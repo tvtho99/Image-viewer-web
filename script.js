@@ -242,12 +242,22 @@ async function decodeManhwaImage(file) {
 function applyNaturalSize(item, img) {
   const { naturalWidth: width, naturalHeight: height } = img;
   if (!width || !height) return;
+  const pinnedToBottom =
+    mainBody.scrollTop > 0 &&
+    mainBody.scrollHeight - mainBody.clientHeight - mainBody.scrollTop <= EDGE_EPSILON;
+  const prevScrollHeight = pinnedToBottom ? mainBody.scrollHeight : 0;
+
   imageDimensionsCache.set(item._file, { width, height });
   const ratio = `${width} / ${height}`;
   item.style.aspectRatio = ratio;
   // The first known page shape is the best estimate for pages not decoded yet.
   if (!gallery.style.getPropertyValue("--manhwa-ratio")) {
     gallery.style.setProperty("--manhwa-ratio", ratio);
+  }
+
+  if (pinnedToBottom) {
+    const delta = mainBody.scrollHeight - prevScrollHeight;
+    if (delta !== 0) mainBody.scrollTop += delta;
   }
 }
 
@@ -309,7 +319,7 @@ function createItem(file, index) {
 }
 
 /* ---------- Reset and load ---------- */
-function resetGallery() {
+function resetGallery(initialScroll = "top") {
   if (loadObserver) loadObserver.disconnect();
   if (unloadObserver) unloadObserver.disconnect();
   loadQueue.clear();
@@ -333,14 +343,15 @@ function resetGallery() {
     loadObserver.observe(item);
     unloadObserver.observe(item);
   }
+  mainBody.scrollTop = initialScroll === "bottom" ? mainBody.scrollHeight : 0;
 }
 
-function showFolderImages(dirHandle, files) {
+function showFolderImages(dirHandle, files, options = {}) {
   currentImageFolderHandle = dirHandle;
   revokeObjectURLs();
   imageDimensionsCache.clear();
   fileObjects = files;
-  resetGallery();
+  resetGallery(options.initialScroll || "top");
 }
 
 // Manga: one delegated listener instead of one per thumbnail
@@ -630,6 +641,7 @@ async function readFolderContents(dirHandle) {
 }
 
 async function openRootFolder(dirHandle) {
+  edgeScroll.reset();
   const contents = await readFolderContents(dirHandle);
   currentFolderHandle = dirHandle;
   rootFileObjects = contents.files;
@@ -706,12 +718,13 @@ function renderSidebarTree() {
   rootChildren.className = "folder-tree-children";
   setFolderExpanded(rootToggle, rootChildren, true);
 
-  async function selectRoot() {
+  async function selectRoot(options = {}) {
     if (currentImageFolderHandle !== currentFolderHandle) {
-      showFolderImages(currentFolderHandle, rootFileObjects);
+      showFolderImages(currentFolderHandle, rootFileObjects, options);
     }
     setActiveFolderButton(rootBtn);
   }
+  rootBtn._selectFolder = selectRoot;
 
   rootToggle.onclick = () => {
     const expanded = rootToggle.getAttribute("aria-expanded") !== "true";
@@ -773,13 +786,13 @@ function renderTreeNodes(nodes, container) {
       return loadPromise;
     }
 
-    async function selectFolder() {
+    async function selectFolder(options = {}) {
       if (selectPromise) return selectPromise;
 
       selectPromise = (async () => {
         const folderContents = await loadChildren();
         if (!(await folderHandlesMatch(currentImageFolderHandle, node.handle))) {
-          showFolderImages(node.handle, folderContents.files);
+          showFolderImages(node.handle, folderContents.files, options);
         }
         setActiveFolderButton(btn);
       })();
@@ -790,6 +803,7 @@ function renderTreeNodes(nodes, container) {
         selectPromise = null;
       }
     }
+    btn._selectFolder = selectFolder;
 
     toggle.onclick = async () => {
       await loadChildren();
@@ -1004,6 +1018,8 @@ class FileSystemEntryFileHandle {
 /* ---------- Clear ---------- */
 clearBtn.addEventListener("click", () => {
   if (modal.open) modal.close();
+  edgeScroll.reset();
+  hideFolderToast();
   currentFolderHandle = null;
   rootFileObjects = [];
   subfolders = [];
@@ -1204,6 +1220,10 @@ const ARROW_SCROLL_SPEED = 30; // Pixels per frame for continuous scroll
 function arrowContinuousScroll() {
   if (arrowScrollVelocity !== 0) {
     mainBody.scrollTop += arrowScrollVelocity;
+    const { atTop, atBottom } = getScrollEdgeState(mainBody);
+    if ((arrowScrollVelocity > 0 && atBottom) || (arrowScrollVelocity < 0 && atTop)) {
+      handleEdgeScrollInput(arrowScrollVelocity);
+    }
     arrowScrollRAF = requestAnimationFrame(arrowContinuousScroll);
   } else {
     arrowScrollRAF = null;
@@ -1264,7 +1284,12 @@ window.addEventListener("keydown", (e) => {
       arrowScrollVelocity = direction * ARROW_SCROLL_SPEED;
       if (!arrowScrollRAF) arrowContinuousScroll();
     } else {
-      mainBody.scrollBy({ top: direction * 400, behavior: "smooth" });
+      const { atTop, atBottom } = getScrollEdgeState(mainBody);
+      if ((direction > 0 && atBottom) || (direction < 0 && atTop)) {
+        handleEdgeScrollInput(direction * EDGE_SCROLL_THRESHOLD);
+      } else {
+        mainBody.scrollBy({ top: direction * 400, behavior: "smooth" });
+      }
     }
   }
 });
@@ -1289,11 +1314,28 @@ async function folderHasImages(handle) {
   return false;
 }
 
-// Navigate to previous/next sibling folder containing images
-// If no sibling with images at current level, go up to parent's siblings
-async function navigateToSiblingFolder(direction) {
+function hasPotentialSiblingFolder(direction) {
   const activeBtn = sidebar.querySelector(".folder-btn.active");
-  if (!activeBtn) return;
+  if (!activeBtn) return false;
+
+  let folderNode = activeBtn.closest(".folder-node");
+  while (folderNode) {
+    const container = folderNode.parentElement;
+    if (!container || container.classList.contains("sidebar-content")) break;
+
+    const siblings = Array.from(container.querySelectorAll(":scope > .folder-node"));
+    const index = siblings.indexOf(folderNode);
+    const nextIndex = index + direction;
+    if (nextIndex >= 0 && nextIndex < siblings.length) return true;
+
+    folderNode = container.closest(".folder-node");
+  }
+  return false;
+}
+
+async function findSiblingFolderButton(direction) {
+  const activeBtn = sidebar.querySelector(".folder-btn.active");
+  if (!activeBtn) return null;
 
   let folderNode = activeBtn.closest(".folder-node");
 
@@ -1312,8 +1354,7 @@ async function navigateToSiblingFolder(direction) {
       const candidateBtn = siblings[nextIndex].querySelector(":scope > .folder-btn");
       if (candidateBtn && candidateBtn._folderHandle) {
         if (await folderHasImages(candidateBtn._folderHandle)) {
-          candidateBtn.click();
-          return;
+          return candidateBtn;
         }
       }
       nextIndex += direction;
@@ -1322,7 +1363,142 @@ async function navigateToSiblingFolder(direction) {
     // No valid sibling found at this level — go up to parent
     folderNode = container.closest(".folder-node");
   }
+  return null;
 }
+
+// Navigate to previous/next sibling folder containing images
+// If no sibling with images at current level, go up to parent's siblings
+async function navigateToSiblingFolder(direction, options = {}) {
+  const candidateBtn = await findSiblingFolderButton(direction);
+  if (!candidateBtn) return null;
+
+  if (options.preserveExpansion && candidateBtn._selectFolder) {
+    await candidateBtn._selectFolder({ initialScroll: options.initialScroll || "top" });
+    candidateBtn.scrollIntoView({ block: "nearest" });
+  } else {
+    candidateBtn.click();
+  }
+  return candidateBtn;
+}
+
+/* ---------- Infinite scroll (sibling folders) ---------- */
+const folderTransitionToast = document.getElementById("folderTransitionToast");
+const edgeScroll = createEdgeScrollController();
+let folderToastTimer = null;
+
+function hideFolderToast() {
+  clearTimeout(folderToastTimer);
+  folderTransitionToast.hidden = true;
+}
+
+function showFolderToast(message, position = "bottom", durationMs = 1600) {
+  clearTimeout(folderToastTimer);
+  folderTransitionToast.textContent = message;
+  folderTransitionToast.classList.toggle("is-top", position === "top");
+  folderTransitionToast.classList.toggle("is-bottom", position !== "top");
+  folderTransitionToast.hidden = false;
+  if (durationMs > 0) {
+    folderToastTimer = setTimeout(hideFolderToast, durationMs);
+  }
+}
+
+async function switchFolderByEdgeScroll(direction) {
+  edgeScroll.setLocked(true);
+  arrowScrollVelocity = 0;
+  showFolderToast(
+    direction > 0 ? "Loading next folder..." : "Loading previous folder...",
+    direction > 0 ? "bottom" : "top",
+    0,
+  );
+  try {
+    const targetBtn = await navigateToSiblingFolder(direction, {
+      initialScroll: direction < 0 ? "bottom" : "top",
+      preserveExpansion: true,
+    });
+    if (targetBtn) {
+      const folderName =
+        targetBtn.querySelector(".folder-name")?.textContent ||
+        targetBtn._folderHandle?.name ||
+        "Folder";
+      showFolderToast(
+        direction > 0 ? `Next: ${folderName}` : `Previous: ${folderName}`,
+        direction > 0 ? "top" : "bottom",
+        1600,
+      );
+    } else {
+      hideFolderToast();
+    }
+  } catch (err) {
+    hideFolderToast();
+    reportFolderError(err);
+  } finally {
+    edgeScroll.startCooldown(Date.now());
+    edgeScroll.setLocked(false);
+  }
+}
+
+function handleEdgeScrollInput(deltaY) {
+  if (fileObjects.length === 0 || modal.open) return;
+  const { atTop, atBottom } = getScrollEdgeState(mainBody);
+  const result = edgeScroll.feed({ deltaY, atTop, atBottom, now: Date.now() });
+  if (result.trigger !== 0) {
+    switchFolderByEdgeScroll(result.trigger);
+  } else if (result.progress > 0 && hasPotentialSiblingFolder(result.direction)) {
+    showFolderToast(
+      result.direction > 0
+        ? "Scroll down for next folder ↓"
+        : "Scroll up for previous folder ↑",
+      result.direction > 0 ? "bottom" : "top",
+      EDGE_RESET_DELAY_MS + 100,
+    );
+  }
+}
+
+mainBody.addEventListener(
+  "wheel",
+  (e) => {
+    if (e.ctrlKey || e.metaKey || e.deltaY === 0) return;
+    handleEdgeScrollInput(e.deltaY);
+  },
+  { passive: true },
+);
+
+let lastTouchY = null;
+mainBody.addEventListener(
+  "touchstart",
+  (e) => {
+    lastTouchY = e.touches.length === 1 ? e.touches[0].clientY : null;
+  },
+  { passive: true },
+);
+mainBody.addEventListener(
+  "touchmove",
+  (e) => {
+    if (e.touches.length !== 1 || lastTouchY === null) {
+      lastTouchY = null;
+      return;
+    }
+    const touchY = e.touches[0].clientY;
+    const deltaY = lastTouchY - touchY;
+    lastTouchY = touchY;
+    if (deltaY !== 0) handleEdgeScrollInput(deltaY);
+  },
+  { passive: true },
+);
+mainBody.addEventListener(
+  "touchend",
+  () => {
+    lastTouchY = null;
+  },
+  { passive: true },
+);
+mainBody.addEventListener(
+  "touchcancel",
+  () => {
+    lastTouchY = null;
+  },
+  { passive: true },
+);
 
 /* ---------- Resize: refit the viewer if not zoomed, otherwise keep the pan in bounds ---------- */
 let resizeTimeout;

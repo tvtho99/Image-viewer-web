@@ -1319,6 +1319,35 @@ body.drag-over .drop-overlay-content {
   transform: translateY(-2px) scale(1.05);
 }
 
+/* Folder transition toast (infinite scroll) */
+.folder-transition-toast {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 95;
+  pointer-events: none;
+  padding: 8px 16px;
+  border-radius: 999px;
+  background: var(--bg-panel-solid);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  font-size: 13px;
+  font-weight: 500;
+  max-width: min(360px, calc(100vw - 32px));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+
+.folder-transition-toast.is-top {
+  top: calc(var(--header-height) + 16px);
+}
+
+.folder-transition-toast.is-bottom {
+  bottom: 24px;
+}
+
 /* Footer */
 .footer {
   width: 100%;
